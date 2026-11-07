@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Raw data
+raw_test/
+data/
+
+# Belt and braces: data file types anywhere in the project
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+*.csv
+*.xlsx
+*.xls
+
