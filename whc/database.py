@@ -1,6 +1,5 @@
 """database.py - the database connection and the base class for table classes.
 
-Nothing in this file knows about students, tests or any specific table.
 Every table gets its own class (see students.py) that inherits from Repository.
 """
 
