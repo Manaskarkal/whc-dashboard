@@ -9,7 +9,7 @@
     Shared helpers (also used by enrolments.py):
         require_text, clean_student_id, parse_enum, ID_PATTERN
 
-Where each rule lives (so you always know where to look):
+Where each rule lives:
     * Python  -> friendly, specific error messages for typed input.
     * SQL     -> the same rules again, so bad data cannot get in even if Python is bypassed.
 """
