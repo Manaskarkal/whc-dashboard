@@ -11,6 +11,7 @@ def main() -> None:
         students = StudentRepository(db)      # creates the parent table first
         enrolments = EnrolmentRepository(db)  # then the child table
         fitness_tests = FitnessTestRepository(db) # the fitness test table
+        fitness_tests.load_catalogue() # populates it 
         print(students.to_dataframe())
         print(enrolments.to_dataframe())
         print(fitness_tests.to_dataframe())

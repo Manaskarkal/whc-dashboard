@@ -36,10 +36,19 @@ from whc.fitness_tests import (
 
 # A test that passes every rule. Tests copy it and change ONE field to break ONE rule.
 GOOD: dict[str, Any] = dict(
-    test_id=101, test_name="Counter Movement Jump Height", category="Power", unit="Centimetres"
+    test_id=101, test_name="Counter Movement Jump Height", category="Power", unit="Centimetres",
+    min_value=10, max_value=90,
 )
 
-RAW_INSERT = "INSERT INTO fitness_tests (test_id, test_name, category, unit) VALUES (?, ?, ?, ?)"
+RAW_INSERT = (
+    "INSERT INTO fitness_tests (test_id, test_name, category, unit, min_value, max_value) "
+    "VALUES (?, ?, ?, ?, ?, ?)"
+)
+
+
+def make(test_id, name, category, unit="Seconds", lo=0, hi=100):
+    """A valid test in a normal unit, with a throwaway 0-100 range (the range is not the point)."""
+    return FitnessTest.new(test_id, name, category, unit, lo, hi)
 
 
 # ---- Fixtures -----------------------------------------------------------------------
@@ -71,14 +80,15 @@ def one(repo):
 # ==== 1. FitnessTest: cleaning and validation =============================================
 def test_new_cleans_input():
     """new() collapses spaces/newlines in the name and matches category and unit loosely."""
-    t = FitnessTest.new(101, "  Counter   Movement\nJump Height ", " pOwEr ", "  centimetres")
+    t = make(101, "  Counter   Movement\nJump Height ", " pOwEr ", "  centimetres")
     assert t.test_name == "Counter Movement Jump Height"
     assert (t.category, t.unit) == (Category.POWER, Unit.CENTIMETRES)
 
 
 def test_new_accepts_unit_with_punctuation_in_any_case():
     """'shuttles:levels' and 'watts/kilogram' contain : and / - they must still match the enum."""
-    assert FitnessTest.new(**{**GOOD, "unit": "SHUTTLES:levels"}).unit is Unit.SHUTTLES_LEVELS
+    pair = FitnessTest.new(401, "Beep Test", "aerobic endurance", "LEVEL:shuttle")
+    assert pair.unit is Unit.LEVEL_SHUTTLE
     assert FitnessTest.new(**{**GOOD, "unit": "watts/KILOGRAM"}).unit is Unit.WATTS_PER_KILOGRAM
 
 
@@ -127,13 +137,13 @@ def test_fitness_test_cannot_be_edited():
 
 
 @pytest.mark.parametrize("build, message", [
-    (lambda: FitnessTest(101, "Jump", "Power", Unit.SECONDS), "category must be a Category"),
+    (lambda: FitnessTest(101, "Jump", "Power", Unit.SECONDS, 0, 100), "category must be a Category"),
     (lambda: FitnessTest(101, "Jump", Category.POWER, "Seconds"), "unit must be a Unit"),
-    (lambda: FitnessTest("101", "Jump", Category.POWER, Unit.SECONDS), "whole number"),
-    (lambda: FitnessTest(101, "Jump\n", Category.POWER, Unit.SECONDS), "test_name"),
-    (lambda: FitnessTest(101, " Jump", Category.POWER, Unit.SECONDS), "test_name"),
-    (lambda: FitnessTest(101, "Jump  Height", Category.POWER, Unit.SECONDS), "test_name"),
-    (lambda: FitnessTest(14, "Jump", Category.POWER, Unit.SECONDS), "does not belong to Power"),
+    (lambda: FitnessTest("101", "Jump", Category.POWER, Unit.SECONDS, 0, 100), "whole number"),
+    (lambda: FitnessTest(101, "Jump\n", Category.POWER, Unit.SECONDS, 0, 100), "test_name"),
+    (lambda: FitnessTest(101, " Jump", Category.POWER, Unit.SECONDS, 0, 100), "test_name"),
+    (lambda: FitnessTest(101, "Jump  Height", Category.POWER, Unit.SECONDS, 0, 100), "test_name"),
+    (lambda: FitnessTest(14, "Jump", Category.POWER, Unit.SECONDS, 0, 100), "does not belong to Power"),
 ], ids=["category-text", "unit-text", "id-text", "name-newline", "name-leading-space",
         "name-double-space", "id-in-wrong-block"])
 def test_directly_built_invalid_test_refused(build, message):
@@ -151,7 +161,7 @@ def test_directly_built_invalid_test_refused(build, message):
 ])
 def test_names_with_allowed_punctuation_are_accepted(name):
     """Proves the name rule is not too strict for the real test names."""
-    assert FitnessTest(101, name, Category.POWER, Unit.SECONDS).test_name == name
+    assert FitnessTest(101, name, Category.POWER, Unit.SECONDS, 0, 100).test_name == name
 
 
 # ==== 2. ID blocks ==========================================================================
@@ -186,22 +196,22 @@ def test_the_blocks_you_asked_for():
 def test_power_block_edges(test_id, accepted):
     """The exact edges of the Power block (101-199), tested against the neighbouring blocks."""
     if accepted:
-        FitnessTest(test_id, "Jump", Category.POWER, Unit.SECONDS)
+        FitnessTest(test_id, "Jump", Category.POWER, Unit.SECONDS, 0, 100)
     else:
         with pytest.raises(ValidationError):
-            FitnessTest(test_id, "Jump", Category.POWER, Unit.SECONDS)
+            FitnessTest(test_id, "Jump", Category.POWER, Unit.SECONDS, 0, 100)
 
 
 @pytest.mark.parametrize("category", list(Category))
 def test_first_and_last_id_of_every_block(category):
     """Each block accepts start+1 and start+99, and refuses the ID just outside either end."""
     start = category.id_start
-    FitnessTest(start + 1, "Jump", category, Unit.SECONDS)
-    FitnessTest(start + 99, "Jump", category, Unit.SECONDS)
+    FitnessTest(start + 1, "Jump", category, Unit.SECONDS, 0, 100)
+    FitnessTest(start + 99, "Jump", category, Unit.SECONDS, 0, 100)
     for outside in (start - 1, start + 101):
         if 1 <= outside <= 999 and outside % 100 != 0:
             with pytest.raises(ValidationError, match="does not belong"):
-                FitnessTest(outside, "Jump", category, Unit.SECONDS)
+                FitnessTest(outside, "Jump", category, Unit.SECONDS, 0, 100)
 
 
 # ==== 3. Repository =======================================================================
@@ -222,25 +232,25 @@ def test_get_by_name_missing_raises_not_found(one):
 def test_duplicate_id_refused(one):
     """Same ID, different test -> DuplicateError about the ID (and the original is untouched)."""
     with pytest.raises(DuplicateError, match="test_id 101 already exists"):
-        one.add(FitnessTest.new(101, "Something Else", "Power", "Metres"))
+        one.add(make(101, "Something Else", "Power", "Metres"))
     assert one.get(101).test_name == "Counter Movement Jump Height"
 
 
 def test_duplicate_name_refused_ignoring_capitals(one):
     """New ID, same name in other capitals -> DuplicateError about the name."""
     with pytest.raises(DuplicateError, match="already exists"):
-        one.add(FitnessTest.new(102, "COUNTER MOVEMENT JUMP HEIGHT", "Power", "Centimetres"))
+        one.add(make(102, "COUNTER MOVEMENT JUMP HEIGHT", "Power", "Centimetres"))
 
 
 def test_same_name_is_refused_even_in_another_category(one):
     """A test name identifies a test on its own, whatever its category."""
     with pytest.raises(DuplicateError, match="already exists"):
-        one.add(FitnessTest.new(1, "Counter Movement Jump Height", "Strength", "Newtons"))
+        one.add(make(1, "Counter Movement Jump Height", "Strength", "Newtons"))
 
 
 def test_different_tests_may_share_a_unit_and_category(one):
     """Proves the unique rules are not too strict (many tests share a category and unit)."""
-    one.add(FitnessTest.new(102, "Broad Jump", "Power", "Centimetres"))
+    one.add(make(102, "Broad Jump", "Power", "Centimetres"))
     assert len(one.all()) == 2
 
 
@@ -266,16 +276,16 @@ def test_add_refuses_things_that_are_not_fitness_tests(repo):
 
 def test_add_many_is_all_or_nothing(repo):
     """If the second test is refused, the first must not stay saved."""
-    first = FitnessTest.new(101, "Jump A", "Power", "Centimetres")
-    clash = FitnessTest.new(102, "jump a", "Power", "Centimetres")  # same name as `first`
+    first = make(101, "Jump A", "Power", "Centimetres")
+    clash = make(102, "jump a", "Power", "Centimetres")  # same name as `first`
     with pytest.raises(DuplicateError):
         repo.add_many([first, clash])
     assert repo.all() == []
 
 
 def test_add_many_with_the_same_id_twice_in_one_batch_is_refused(repo):
-    a = FitnessTest.new(101, "Jump A", "Power", "Centimetres")
-    b = FitnessTest.new(101, "Jump B", "Power", "Centimetres")
+    a = make(101, "Jump A", "Power", "Centimetres")
+    b = make(101, "Jump B", "Power", "Centimetres")
     with pytest.raises(DuplicateError, match="test_id 101"):
         repo.add_many([a, b])
     assert repo.all() == []
@@ -304,7 +314,7 @@ def test_filter_by_unknown_category_is_refused(loaded):
 def test_results_are_ordered_by_test_id(repo):
     """Saved in a jumbled order, read back in ID order every time."""
     for tid, cat in ((301, "Agility"), (1, "Strength"), (201, "Speed"), (101, "Power")):
-        repo.add(FitnessTest.new(tid, f"Test {tid}", cat, "Seconds"))
+        repo.add(make(tid, f"Test {tid}", cat, "Seconds"))
     assert [t.test_id for t in repo.all()] == [1, 101, 201, 301]
 
 
@@ -323,13 +333,13 @@ def test_next_id_follows_the_highest_id_in_the_block(loaded):
 
 def test_next_id_does_not_look_at_other_blocks(repo):
     """A test numbered 105 must not push Speed's next ID to 106."""
-    repo.add(FitnessTest.new(105, "Jump", "Power", "Metres"))
+    repo.add(make(105, "Jump", "Power", "Metres"))
     assert repo.next_id("Speed") == 201
 
 
 def test_next_id_can_be_used_to_add_a_test(loaded):
     new_id = loaded.next_id("Power")
-    loaded.add(FitnessTest.new(new_id, "Depth Jump", "Power", "Centimetres"))
+    loaded.add(make(new_id, "Depth Jump", "Power", "Centimetres"))
     assert loaded.get(new_id).test_name == "Depth Jump"
     assert loaded.next_id("Power") == new_id + 1
 
@@ -337,7 +347,7 @@ def test_next_id_can_be_used_to_add_a_test(loaded):
 def test_next_id_refuses_when_the_block_is_full(repo):
     """99 tests fill a block; the 100th must be refused cleanly, not spill into the next block."""
     repo.add_many(FitnessTest(101 + i, f"Jump {chr(65 + i // 26)}{chr(65 + i % 26)}",
-                              Category.POWER, Unit.SECONDS) for i in range(99))
+                              Category.POWER, Unit.SECONDS, 0, 100) for i in range(99))
     with pytest.raises(ValidationError, match="no free test_id left"):
         repo.next_id("Power")
 
@@ -406,31 +416,31 @@ def test_tests_cannot_be_deleted(db, one):
 
 # ==== 4. The database itself refuses bad data, even if Python is bypassed ================
 @pytest.mark.parametrize("values, message", [
-    ((106, "Jump", "Balance", "Seconds"), "FOREIGN KEY"),             # category not in lookup table
-    ((106, "Jump", "Power", "Furlongs"), "FOREIGN KEY"),              # unit not in lookup table
-    ((None, "Jump", "Power", "Seconds"), "NOT NULL"),                 # NULL ID must not auto-number
-    ((106, None, "Power", "Seconds"), "NOT NULL"),
-    ((106, "Jump", None, "Seconds"), "NOT NULL"),
-    ((106, "Jump", "Power", None), "NOT NULL"),
-    (("abc", "Jump", "Power", "Seconds"), "test_id"),                 # STRICT: wrong type
-    ((106, 123, "Power", "Seconds"), "test_name"),                    # STRICT: number as name
-    ((0, "Jump", "Strength", "Seconds"), "test_id"),                  # 0 is never used
-    ((100, "Jump", "Power", "Seconds"), "test_id"),                   # round numbers unused
-    ((-5, "Jump", "Strength", "Seconds"), "test_id"),                 # negative
-    ((5, "Jump", "Power", "Seconds"), "block of this category"),      # Strength ID, Power category
-    ((201, "Jump", "Power", "Seconds"), "block of this category"),    # Speed ID, Power category
-    ((1000, "Jump", "Power", "Seconds"), "block of this category"),   # beyond every block
-    ((106, "", "Power", "Seconds"), "test_name"),                     # empty name
-    ((106, " Jump", "Power", "Seconds"), "test_name"),                # leading space
-    ((106, "Jump ", "Power", "Seconds"), "test_name"),                # trailing space
-    ((106, "Jump\n", "Power", "Seconds"), "test_name"),               # trailing newline
-    ((106, "Jump\tHeight", "Power", "Seconds"), "test_name"),         # tab inside
-    ((106, "Jump  Height", "Power", "Seconds"), "test_name"),         # double space
-    ((106, "(Jump)", "Power", "Seconds"), "test_name"),               # starts with punctuation
-    ((106, "12345", "Power", "Seconds"), "test_name"),                # no letter
-    ((106, "Jump_Height", "Power", "Seconds"), "test_name"),          # underscore
-    ((106, "Jump;--", "Power", "Seconds"), "test_name"),              # SQL-ish characters
-    ((106, "A" * (NAME_MAX_LENGTH + 1), "Power", "Seconds"), "test_name"),  # too long
+    ((106, "Jump", "Balance", "Seconds", 0, 100), "FOREIGN KEY"),             # category not in lookup table
+    ((106, "Jump", "Power", "Furlongs", 0, 100), "FOREIGN KEY"),              # unit not in lookup table
+    ((None, "Jump", "Power", "Seconds", 0, 100), "NOT NULL"),                 # NULL ID must not auto-number
+    ((106, None, "Power", "Seconds", 0, 100), "NOT NULL"),
+    ((106, "Jump", None, "Seconds", 0, 100), "NOT NULL"),
+    ((106, "Jump", "Power", None, 0, 100), "NOT NULL"),
+    (("abc", "Jump", "Power", "Seconds", 0, 100), "test_id"),                 # STRICT: wrong type
+    ((106, 123, "Power", "Seconds", 0, 100), "test_name"),                    # STRICT: number as name
+    ((0, "Jump", "Strength", "Seconds", 0, 100), "test_id"),                  # 0 is never used
+    ((100, "Jump", "Power", "Seconds", 0, 100), "test_id"),                   # round numbers unused
+    ((-5, "Jump", "Strength", "Seconds", 0, 100), "test_id"),                 # negative
+    ((5, "Jump", "Power", "Seconds", 0, 100), "block of this category"),      # Strength ID, Power category
+    ((201, "Jump", "Power", "Seconds", 0, 100), "block of this category"),    # Speed ID, Power category
+    ((1000, "Jump", "Power", "Seconds", 0, 100), "block of this category"),   # beyond every block
+    ((106, "", "Power", "Seconds", 0, 100), "test_name"),                     # empty name
+    ((106, " Jump", "Power", "Seconds", 0, 100), "test_name"),                # leading space
+    ((106, "Jump ", "Power", "Seconds", 0, 100), "test_name"),                # trailing space
+    ((106, "Jump\n", "Power", "Seconds", 0, 100), "test_name"),               # trailing newline
+    ((106, "Jump\tHeight", "Power", "Seconds", 0, 100), "test_name"),         # tab inside
+    ((106, "Jump  Height", "Power", "Seconds", 0, 100), "test_name"),         # double space
+    ((106, "(Jump)", "Power", "Seconds", 0, 100), "test_name"),               # starts with punctuation
+    ((106, "12345", "Power", "Seconds", 0, 100), "test_name"),                # no letter
+    ((106, "Jump_Height", "Power", "Seconds", 0, 100), "test_name"),          # underscore
+    ((106, "Jump;--", "Power", "Seconds", 0, 100), "test_name"),              # SQL-ish characters
+    ((106, "A" * (NAME_MAX_LENGTH + 1), "Power", "Seconds", 0, 100), "test_name"),  # too long
 ], ids=["bad-category", "bad-unit", "null-id", "null-name", "null-category", "null-unit",
         "text-id", "numeric-name", "id-zero", "id-100", "id-negative", "strength-id-in-power",
         "speed-id-in-power", "id-1000", "empty-name", "leading-space", "trailing-space",
@@ -446,13 +456,13 @@ def test_database_refuses_bad_rows(db, repo, values, message):
 def test_database_accepts_a_name_of_exactly_the_maximum_length(db, repo):
     """Proves the length limit is a limit, not an off-by-one that refuses valid names."""
     with db.transaction() as conn:
-        conn.execute(RAW_INSERT, (106, "A" * NAME_MAX_LENGTH, "Power", "Seconds"))
+        conn.execute(RAW_INSERT, (106, "A" * NAME_MAX_LENGTH, "Power", "Seconds", 0, 100))
 
 
 def test_database_refuses_duplicate_names_ignoring_capitals(db, one):
     with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
         with db.transaction() as conn:
-            conn.execute(RAW_INSERT, (106, "counter movement jump HEIGHT", "Power", "Seconds"))
+            conn.execute(RAW_INSERT, (106, "counter movement jump HEIGHT", "Power", "Seconds", 0, 100))
 
 
 @pytest.mark.parametrize("column, value", [
@@ -487,8 +497,8 @@ def test_foreign_keys_protect_the_lookup_tables(db, one):
 def test_a_refused_raw_insert_leaves_nothing_behind(db, one):
     with pytest.raises(sqlite3.IntegrityError):
         with db.transaction() as conn:
-            conn.execute(RAW_INSERT, (102, "Fine Name", "Power", "Seconds"))  # valid row...
-            conn.execute(RAW_INSERT, (5, "Other Name", "Power", "Seconds"))   # ...then a bad one
+            conn.execute(RAW_INSERT, (102, "Fine Name", "Power", "Seconds", 0, 100))  # valid row...
+            conn.execute(RAW_INSERT, (5, "Other Name", "Power", "Seconds", 0, 100))   # ...then a bad one
     assert [t.test_id for t in one.all()] == [101]  # the valid row was rolled back too
 
 
@@ -526,9 +536,9 @@ EXPECTED = [
     ("Standing Long Jump (Broad Jump)", "Power", "Metres"),
     ("Isometric Mid-Thigh Pull Peak", "Strength", "Newtons"),
     ("Isometric Mid-Thigh Pull Relative", "Strength", "Unitless"),
-    ("YOYO Intermittent Recovery Test 1 (IRT1)", "Aerobic Endurance", "Shuttles:Levels"),
-    ("YOYO Intermittent Recovery Test 2 (IRT2)", "Anaerobic Endurance", "Shuttles:Levels"),
-    ("20m Beep Test (Shuttle Run)", "Aerobic Endurance", "Shuttles:Levels"),
+    ("YOYO Intermittent Recovery Test 1 (IRT1)", "Aerobic Endurance", "Level:Shuttle"),
+    ("YOYO Intermittent Recovery Test 2 (IRT2)", "Anaerobic Endurance", "Level:Shuttle"),
+    ("20m Beep Test (Shuttle Run)", "Aerobic Endurance", "Level:Shuttle"),
     ("Cooper 12-Minute Run", "Aerobic Endurance", "Metres"),
     ("1.6k/Mile Run", "Aerobic Endurance", "Seconds"),
     ("2k Run", "Aerobic Endurance", "Seconds"),
@@ -557,6 +567,45 @@ EXPECTED = [
 ]
 
 
+# name -> (min, max); Level:Shuttle tests are deliberately absent (they have no range).
+EXPECTED_RANGES = {
+    "Isometric Mid-Thigh Pull Peak": (300, 6000),
+    "Isometric Mid-Thigh Pull Relative": (1, 6),
+    "Nordic Hamstring Left": (50, 800), "Nordic Hamstring Right": (50, 800),
+    "Adduction Left": (50, 800), "Adduction Right": (50, 800),
+    "Abduction Left": (50, 800), "Abduction Right": (50, 800),
+    "1RM Back Squat": (20, 350), "1RM Bench Press": (20, 250), "1RM Trap Bar Deadlift": (30, 400),
+    "3RM Back Squat": (20, 320), "3RM Bench Press": (20, 230), "3RM Trap Bar Deadlift": (30, 380),
+    "Counter Movement Jump Height": (10, 90),
+    "Counter Movement Jump Power": (15, 80),
+    "Counter Movement Jump Relative Strength Index (RSI)": (0.1, 1.2),
+    "Hop Jump Relative Strength Index (RSI)": (0.3, 5),
+    "Standing Long Jump (Broad Jump)": (0.8, 3.6),
+    "5 Metre Sprint": (0.8, 2.0), "10 Metre Sprint": (1.4, 3.0), "20 Metre Sprint": (2.6, 4.5),
+    "5-0-5 Agility Test Left": (2.0, 3.8), "5-0-5 Agility Test Right": (2.0, 3.8),
+    "NBA Lane Agility Test": (8, 18),
+    "Cooper 12-Minute Run": (1000, 4500), "1.6k/Mile Run": (220, 1200), "2k Run": (300, 1500),
+    "Push Up Test (1-Minute)": (0, 120), "Pull Up Test (1-Minute)": (0, 60),
+    "Sit-and-Reach Test": (-30, 50),
+    "Reaction Time Ruler Drop Test": (1, 40),
+}
+
+
+def test_catalogue_ranges_match_the_agreed_table():
+    got = {t.test_name: (t.min_value, t.max_value) for t in DEFAULT_TESTS if t.min_value is not None}
+    assert got == EXPECTED_RANGES
+
+
+def test_only_level_shuttle_tests_have_no_range():
+    no_range = {t.test_name for t in DEFAULT_TESTS if t.min_value is None}
+    assert no_range == {
+        "YOYO Intermittent Recovery Test 1 (IRT1)",
+        "YOYO Intermittent Recovery Test 2 (IRT2)",
+        "20m Beep Test (Shuttle Run)",
+    }
+    assert all(t.unit is Unit.LEVEL_SHUTTLE for t in DEFAULT_TESTS if t.min_value is None)
+
+
 def test_catalogue_matches_the_requested_list_exactly():
     got = sorted((t.test_name, t.category.value, t.unit.value) for t in DEFAULT_TESTS)
     assert got == sorted(EXPECTED)
@@ -574,7 +623,7 @@ def test_load_catalogue_is_repeatable_and_does_not_duplicate(loaded):
 
 def test_load_catalogue_keeps_other_tests_and_fills_the_gaps(repo):
     """A database that already has some rows (even your own extra test) just gets the rest."""
-    repo.add(FitnessTest.new(106, "Depth Jump", "Power", "Centimetres"))  # my own extra test
+    repo.add(make(106, "Depth Jump", "Power", "Centimetres"))  # my own extra test
     repo.add(DEFAULT_TESTS[0])  # one catalogue test already there
     repo.load_catalogue()
     assert len(repo.all()) == 36
@@ -591,7 +640,7 @@ def test_load_catalogue_respects_a_rename(loaded):
 
 def test_load_catalogue_refuses_to_overwrite_a_conflicting_row(repo):
     """ID 101 already means something else here: results would be mislabelled, so stop."""
-    repo.add(FitnessTest.new(101, "Depth Jump", "Power", "Metres"))  # catalogue says Centimetres
+    repo.add(make(101, "Depth Jump", "Power", "Metres"))  # catalogue says Centimetres
     with pytest.raises(ValidationError, match="test_id 101 is already used"):
         repo.load_catalogue()
     assert len(repo.all()) == 1  # nothing else was loaded either (all-or-nothing)
@@ -599,7 +648,7 @@ def test_load_catalogue_refuses_to_overwrite_a_conflicting_row(repo):
 
 def test_load_catalogue_refuses_a_name_taken_by_another_id(repo):
     """The catalogue's name is already in use at a different ID: clean DuplicateError, no partial load."""
-    repo.add(FitnessTest.new(106, "Counter Movement Jump Height", "Power", "Centimetres"))
+    repo.add(make(106, "Counter Movement Jump Height", "Power", "Centimetres"))
     with pytest.raises(DuplicateError, match="already exists"):
         repo.load_catalogue()
     assert len(repo.all()) == 1
@@ -612,6 +661,8 @@ def test_dataframe_types_even_when_empty(repo):
     assert schema["test_name"] == pl.String
     assert isinstance(schema["category"], pl.Enum)
     assert isinstance(schema["unit"], pl.Enum)
+    assert schema["min_value"] == pl.Float64
+    assert schema["max_value"] == pl.Float64
 
 
 def test_dataframe_has_real_values(one):
@@ -621,10 +672,21 @@ def test_dataframe_has_real_values(one):
     assert df["test_name"].to_list() == ["Counter Movement Jump Height"]
     assert df["category"].to_list() == ["Power"]
     assert df["unit"].to_list() == ["Centimetres"]
+    assert df["min_value"].to_list() == [10.0]
+    assert df["max_value"].to_list() == [90.0]
+
+
+def test_dataframe_shows_missing_ranges_as_null_not_zero(loaded):
+    """Level:Shuttle tests have no range; that must read as null, never as 0."""
+    df = loaded.to_dataframe(category="Aerobic Endurance").filter(pl.col("unit") == "Level:Shuttle")
+    assert df["test_id"].to_list() == [401, 402]
+    assert df["min_value"].null_count() == 2 and df["max_value"].null_count() == 2
 
 
 def test_dataframe_column_names_and_order(repo):
-    assert repo.to_dataframe().columns == ["test_id", "test_name", "category", "unit"]
+    assert repo.to_dataframe().columns == [
+        "test_id", "test_name", "category", "unit", "min_value", "max_value"
+    ]
 
 
 def test_dataframe_category_filter(loaded):
@@ -659,7 +721,7 @@ def test_a_unit_missing_from_an_old_database_is_added_on_startup(db, repo):
     with db.transaction() as conn:
         conn.execute("DELETE FROM test_units WHERE name = 'Reps'")  # pretend an old file
     FitnessTestRepository(db)  # start-up runs again
-    repo.add(FitnessTest.new(601, "Sit Ups", "Muscular Endurance", "Reps"))  # fails without the refill
+    repo.add(make(601, "Sit Ups", "Muscular Endurance", "Reps"))  # fails without the refill
 
 
 def test_a_changed_block_in_an_old_database_stops_start_up(db, repo):
@@ -686,7 +748,7 @@ def test_triggers_are_rebuilt_on_startup(db, repo):
     FitnessTestRepository(db)  # start-up runs again
     with pytest.raises(sqlite3.IntegrityError, match="block of this category"):
         with db.transaction() as conn:
-            conn.execute(RAW_INSERT, (5, "Jump", "Power", "Seconds"))
+            conn.execute(RAW_INSERT, (5, "Jump", "Power", "Seconds", 0, 100))
 
 
 def test_the_other_triggers_are_rebuilt_too(db, repo):
@@ -717,3 +779,249 @@ def test_replace_cannot_smuggle_in_an_invalid_test(one):
         replace(good, test_id=5)
     with pytest.raises(ValidationError, match="unit must be a Unit"):
         replace(good, unit="Seconds")
+
+
+# ==== 8. Level:Shuttle unit and min/max ranges ==============================================
+def test_level_shuttle_unit_is_named_level_first():
+    """The unit's name states the order: level, then shuttle. The old name must be gone."""
+    assert Unit.LEVEL_SHUTTLE.value == "Level:Shuttle"
+    with pytest.raises(ValidationError, match="unit must be one of"):
+        FitnessTest.new(401, "Beep Test", "Aerobic Endurance", "Shuttles:Levels")
+
+
+def test_new_stores_the_range_as_given():
+    t = FitnessTest.new(**{**GOOD, "min_value": 12.5, "max_value": 88})
+    assert (t.min_value, t.max_value) == (12.5, 88)
+
+
+@pytest.mark.parametrize("lo, hi", [(-30, 50), (0, 0.5), (-1.5, -0.5), (1e-9, 2e-9), (-1_000_000, 1_000_000)])
+def test_valid_ranges_are_accepted(lo, hi):
+    """Negative, fractional, tiny and at-the-limit ranges are all legitimate."""
+    FitnessTest.new(**{**GOOD, "min_value": lo, "max_value": hi})
+
+
+@pytest.mark.parametrize("lo, hi, message", [
+    (None, None, "both required"),
+    (10, None, "both required"),
+    (None, 90, "both required"),
+    (90, 10, "min_value must be below"),            # swapped
+    (50, 50, "min_value must be below"),            # zero-width range
+    ("10", 90, "must be numbers"),                  # text that looks like a number
+    (10, "90", "must be numbers"),
+    (True, 90, "must be numbers"),                  # True is the number 1 in Python
+    (10, False, "must be numbers"),
+    (float("nan"), 90, "must be numbers"),
+    (10, float("nan"), "must be numbers"),
+    (float("-inf"), 90, "must be numbers"),
+    (10, float("inf"), "must be numbers"),
+    (-1_000_001, 90, "must be between"),            # one past the limit
+    (10, 1_000_001, "must be between"),
+    ([10], 90, "must be numbers"),
+])
+def test_bad_ranges_refused(lo, hi, message):
+    with pytest.raises(ValidationError, match=message):
+        FitnessTest.new(**{**GOOD, "min_value": lo, "max_value": hi})
+
+
+@pytest.mark.parametrize("lo, hi", [(1, 5), (1, None), (None, 5), (0, 0)])
+def test_level_shuttle_tests_must_have_no_range(lo, hi):
+    """A pair of numbers has no single min/max. Any value at all (even 0) is refused."""
+    with pytest.raises(ValidationError, match="no min_value/max_value"):
+        FitnessTest.new(401, "Beep Test", "Aerobic Endurance", "Level:Shuttle", lo, hi)
+
+
+def test_level_shuttle_test_without_range_is_valid():
+    t = FitnessTest.new(401, "Beep Test", "Aerobic Endurance", "Level:Shuttle")
+    assert (t.min_value, t.max_value) == (None, None)
+
+
+# ---- check_value ----
+@pytest.mark.parametrize("value", [10, 90, 10.0001, 50, 89.9999])
+def test_check_value_accepts_inside_and_on_the_edges(value):
+    """Both ends are inclusive: exactly min and exactly max are fine."""
+    FitnessTest.new(**GOOD).check_value(value)
+
+
+@pytest.mark.parametrize("value", [9.9999, 90.0001, -5, 0, 1000])
+def test_check_value_refuses_outside_the_range(value):
+    with pytest.raises(ValidationError, match="outside the allowed range 10 to 90 Centimetres"):
+        FitnessTest.new(**GOOD).check_value(value)
+
+
+@pytest.mark.parametrize("value", ["50", None, True, float("nan"), float("inf"), [50]])
+def test_check_value_refuses_non_numbers(value):
+    with pytest.raises(ValidationError, match="must be a number"):
+        FitnessTest.new(**GOOD).check_value(value)
+
+
+def test_check_value_refuses_a_level_shuttle_test():
+    beep = FitnessTest.new(402, "Beep Test", "Aerobic Endurance", "Level:Shuttle")
+    with pytest.raises(ValidationError, match="pair of numbers"):
+        beep.check_value(10)
+
+
+def test_check_value_works_for_a_real_catalogue_test(loaded):
+    """A 20 m sprint of 35 seconds is a typo; 3.1 seconds is believable."""
+    sprint = loaded.get_by_name("20 Metre Sprint")
+    sprint.check_value(3.1)
+    with pytest.raises(ValidationError, match="outside the allowed range"):
+        sprint.check_value(35)
+
+
+def test_check_value_allows_a_negative_sit_and_reach(loaded):
+    """Negative reach (fingertips short of the toes) is a normal result, not an error."""
+    loaded.get_by_name("Sit-and-Reach Test").check_value(-12)
+
+
+# ---- set_range ----
+def test_set_range_changes_only_the_range(one):
+    one.set_range(101, 15, 80)
+    after = one.get(101)
+    assert (after.min_value, after.max_value) == (15, 80)
+    assert (after.test_id, after.test_name, after.category, after.unit) == (
+        101, "Counter Movement Jump Height", Category.POWER, Unit.CENTIMETRES)
+
+
+def test_set_range_leaves_every_other_test_alone(loaded):
+    """If the WHERE clause were lost, every test would get the same range."""
+    before = {t.test_id: t for t in loaded.all()}
+    loaded.set_range(101, 15, 80)
+    after = {t.test_id: t for t in loaded.all()}
+    assert (after[101].min_value, after[101].max_value) == (15, 80)
+    assert {k: v for k, v in after.items() if k != 101} == {k: v for k, v in before.items() if k != 101}
+
+
+@pytest.mark.parametrize("lo, hi", [(90, 10), (10, 10), (None, 90), (10, None), ("a", 90), (float("nan"), 90)])
+def test_set_range_refuses_bad_values_and_changes_nothing(one, lo, hi):
+    with pytest.raises(ValidationError):
+        one.set_range(101, lo, hi)
+    assert (one.get(101).min_value, one.get(101).max_value) == (10, 90)
+
+
+def test_set_range_refuses_a_level_shuttle_test(loaded):
+    with pytest.raises(ValidationError, match="no min_value/max_value"):
+        loaded.set_range(401, 1, 24)
+    assert loaded.get(401).min_value is None
+
+
+def test_set_range_missing_test_raises_not_found(repo):
+    with pytest.raises(NotFoundError):
+        repo.set_range(101, 10, 90)
+
+
+@pytest.mark.parametrize("bad_id", ["101", None, True])
+def test_set_range_needs_a_whole_number_id(repo, bad_id):
+    with pytest.raises(ValidationError, match="whole number"):
+        repo.set_range(bad_id, 10, 90)
+
+
+def test_a_tuned_range_survives_reloading_the_catalogue(loaded):
+    """load_catalogue() must never overwrite a range you tuned with the catalogue's version."""
+    loaded.set_range(101, 15, 80)
+    loaded.load_catalogue()
+    assert (loaded.get(101).min_value, loaded.get(101).max_value) == (15, 80)
+
+
+def test_add_saves_the_range(repo):
+    repo.add(make(106, "Depth Jump", "Power", "Centimetres", 5, 70))
+    assert (repo.get(106).min_value, repo.get(106).max_value) == (5, 70)
+
+
+# ---- the database enforces the range rule too ----
+@pytest.mark.parametrize("unit, lo, hi", [
+    ("Seconds", None, None),            # normal unit with no range
+    ("Seconds", 1, None),
+    ("Seconds", None, 9),
+    ("Seconds", 9, 1),                  # swapped
+    ("Seconds", 5, 5),                  # zero width
+    ("Seconds", float("nan"), 9),       # SQLite stores NaN as NULL
+    ("Seconds", -1_000_001, 9),         # beyond the limit
+    ("Seconds", 1, 1_000_001),
+    ("Level:Shuttle", 1, 24),           # a pair of numbers cannot have a single range
+    ("Level:Shuttle", 0, 0),
+    ("Level:Shuttle", 1, None),
+])
+def test_database_refuses_a_range_that_breaks_the_rule(db, repo, unit, lo, hi):
+    with pytest.raises(sqlite3.IntegrityError, match="range_matches_unit"):
+        with db.transaction() as conn:
+            conn.execute(RAW_INSERT, (106, "Jump", "Power", unit, lo, hi))
+
+
+def test_database_accepts_a_level_shuttle_row_without_a_range(db, repo):
+    with db.transaction() as conn:
+        conn.execute(RAW_INSERT, (406, "Another Shuttle Test", "Aerobic Endurance", "Level:Shuttle", None, None))
+
+
+def test_database_refuses_text_in_a_range_column(db, repo):
+    """STRICT tables reject words in a number column."""
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.transaction() as conn:
+            conn.execute(RAW_INSERT, (106, "Jump", "Power", "Seconds", "low", 9))
+
+
+def test_range_is_not_locked_but_still_checked_at_sql_level(db, one):
+    """The identity lock covers id/category/unit only; the range stays tunable, but never invalid."""
+    with db.transaction() as conn:
+        conn.execute("UPDATE fitness_tests SET min_value = 20, max_value = 70")
+    with pytest.raises(sqlite3.IntegrityError, match="range_matches_unit"):
+        with db.transaction() as conn:
+            conn.execute("UPDATE fitness_tests SET min_value = 99")  # now above max_value 70
+    with pytest.raises(sqlite3.IntegrityError, match="range_matches_unit"):
+        with db.transaction() as conn:
+            conn.execute("UPDATE fitness_tests SET min_value = NULL")
+
+
+# ---- upgrading an old database ----
+OLD_TABLE = """
+CREATE TABLE test_units (name TEXT PRIMARY KEY) STRICT;
+CREATE TABLE test_categories (name TEXT PRIMARY KEY, id_start INTEGER NOT NULL UNIQUE) STRICT;
+CREATE TABLE fitness_tests (
+    test_id INTEGER PRIMARY KEY, test_name TEXT NOT NULL,
+    category TEXT NOT NULL REFERENCES test_categories(name),
+    unit TEXT NOT NULL REFERENCES test_units(name)
+) STRICT, WITHOUT ROWID;
+INSERT INTO test_units VALUES ('Shuttles:Levels');
+INSERT INTO test_categories VALUES ('Power', 100);
+INSERT INTO fitness_tests VALUES (401, 'YOYO Intermittent Recovery Test 1 (IRT1)', 'Power', 'Shuttles:Levels');
+"""
+
+
+def test_old_four_column_table_stops_start_up_with_a_clear_fix(db):
+    """The exact situation after upgrading: an old whc.db must give a helpful message, not 'no such column'."""
+    db.run_script(OLD_TABLE)
+    with pytest.raises(RuntimeError, match="old fitness_tests table") as err:
+        FitnessTestRepository(db)
+    assert "drop_tables" in str(err.value)  # the message includes the rebuild command
+
+
+def test_drop_tables_is_the_documented_fix(db):
+    """Following the error message's instructions must actually upgrade the database."""
+    db.run_script(OLD_TABLE)
+    with pytest.raises(RuntimeError):
+        FitnessTestRepository(db)
+    FitnessTestRepository.drop_tables(db)
+    fresh = FitnessTestRepository(db)  # now builds the new layout
+    fresh.load_catalogue()
+    assert len(fresh.all()) == 35
+    assert fresh.get(401).unit is Unit.LEVEL_SHUTTLE
+
+
+def test_drop_tables_leaves_other_tables_alone(db):
+    """Rebuilding the fitness tables must never touch students or enrolments."""
+    db.run_script("CREATE TABLE students (student_id INTEGER PRIMARY KEY); INSERT INTO students VALUES (7);")
+    FitnessTestRepository(db).load_catalogue()
+    FitnessTestRepository.drop_tables(db)
+    assert db.query("SELECT student_id FROM students") == [(7,)]
+    names = {r[0] for r in db.query("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert names.isdisjoint({"fitness_tests", "test_categories", "test_units"})
+
+
+def test_drop_tables_is_safe_when_nothing_exists(db):
+    FitnessTestRepository.drop_tables(db)
+    FitnessTestRepository.drop_tables(db)
+
+
+def test_current_table_passes_the_up_to_date_check(db, one):
+    """A correct table must NOT trigger the 'old table' error on every start-up."""
+    FitnessTestRepository(db)
+    assert one.get(101).min_value == 10
