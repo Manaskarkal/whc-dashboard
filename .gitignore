@@ -21,4 +21,21 @@ data/
 *.csv
 *.xlsx
 *.xls
+*.bak
+backups/
+
+# Secrets, credentials, and environment files
+.env
+.env.*
+*.pem
+*.key
+*.secret
+secrets.toml
+.streamlit/secrets.toml
+
+# Caches and logs
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.log
 

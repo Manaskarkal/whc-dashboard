@@ -244,6 +244,17 @@ DROP TRIGGER IF EXISTS enrolments_lock_identity;
 CREATE TRIGGER enrolments_lock_identity
 BEFORE UPDATE OF enrolment_id, student_id, season_year, sport, created_at ON enrolments
 BEGIN SELECT RAISE(ABORT, 'enrolment identity details are locked'); END;
+
+DROP TRIGGER IF EXISTS enrolments_dob_fits_existing_grades;
+CREATE TRIGGER enrolments_dob_fits_existing_grades
+BEFORE UPDATE OF dob ON students
+WHEN NEW.dob IS NOT NULL AND EXISTS (
+    SELECT 1 FROM enrolments e JOIN grades g ON g.name = e.grade
+    WHERE e.student_id = NEW.student_id
+      AND NOT ((e.season_year - CAST(substr(NEW.dob, 1, 4) AS INTEGER))
+               BETWEEN g.level + {AGE_OFFSET_MIN} AND g.level + {AGE_OFFSET_MAX})
+)
+BEGIN SELECT RAISE(ABORT, 'grade does not fit the student age in that season'); END;
 """
 
 _SELECT = (
@@ -336,10 +347,15 @@ class EnrolmentRepository(Repository):
             raise NotFoundError(f"enrolment_id {enrolment_id} does not exist")
 
     def delete(self, enrolment_id: int) -> None:
-        """Delete an enrolment only while no results reference it (future FK RESTRICT)."""
+        """Delete an enrolment only while no results reference it (FK RESTRICT)."""
         _check_enrolment_id(enrolment_id)
-        with self._db.transaction() as conn:
-            cursor = conn.execute("DELETE FROM enrolments WHERE enrolment_id = ?", (enrolment_id,))
+        try:
+            with self._db.transaction() as conn:
+                cursor = conn.execute("DELETE FROM enrolments WHERE enrolment_id = ?", (enrolment_id,))
+        except sqlite3.IntegrityError:
+            raise ValidationError(
+                f"cannot delete enrolment_id {enrolment_id} while test results are recorded for it"
+            ) from None
         if cursor.rowcount == 0:
             raise NotFoundError(f"enrolment_id {enrolment_id} does not exist")
 

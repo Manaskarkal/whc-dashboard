@@ -509,3 +509,18 @@ def test_an_old_enrolments_table_gives_a_clear_error():
             )
         with pytest.raises(RuntimeError, match="old enrolments table"):
             EnrolmentRepository(database)
+
+
+def test_student_without_dob_can_enrol_and_later_dob_must_fit_enrolled_grades(students, repo):
+    """A student imported with dob=None can enrol; if dob is set later, it must fit their grades."""
+    students.add(Student.new("DDD0001", "Ava", "Fox", None, "Female"))
+    repo.add(Enrolment.new("DDD0001", 2025, "Netball", "Year 12"))
+
+    # Born in 2015 (age 10 in 2025) does not fit Year 12 (needs 15-20): refused by trigger.
+    with pytest.raises(ValidationError, match="does not fit the student age"):
+        students.set_dob("DDD0001", "01/06/2015")
+    assert students.get("DDD0001").dob is None
+
+    # Born in 2008 (age 17 in 2025) fits Year 12: accepted.
+    students.set_dob("DDD0001", "01/06/2008")
+    assert students.get("DDD0001").dob == date(2008, 6, 1)

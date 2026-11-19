@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import StrEnum
 from typing import TypeVar
@@ -113,7 +113,7 @@ class Student:
     student_id: str
     first_name: str
     last_name: str
-    dob: date
+    dob: date | None
     sex: Sex
     is_active: bool = True
 
@@ -135,29 +135,31 @@ class Student:
             raise ValidationError("sex must be a Sex value")
         if not isinstance(self.is_active, bool):
             raise ValidationError("is_active must be True or False")
-        # datetime is a subclass of date, so it is excluded explicitly.
-        if not isinstance(self.dob, date) or isinstance(self.dob, datetime):
-            raise ValidationError("dob must be a date")
-        if self.dob < MIN_DOB:
-            raise ValidationError(f"dob must be on or after {MIN_DOB.isoformat()}")
-        if self.dob >= _today():
-            raise ValidationError("dob must be in the past")
+        if self.dob is not None:
+            # datetime is a subclass of date, so it is excluded explicitly.
+            if not isinstance(self.dob, date) or isinstance(self.dob, datetime):
+                raise ValidationError("dob must be a date or None")
+            if self.dob < MIN_DOB:
+                raise ValidationError(f"dob must be on or after {MIN_DOB.isoformat()}")
+            if self.dob >= _today():
+                raise ValidationError("dob must be in the past")
 
     @classmethod
-    def new(cls, student_id: str, first_name: str, last_name: str, dob: str, sex: str,
+    def new(cls, student_id: str, first_name: str, last_name: str, dob: str | None, sex: str,
             *, is_active: bool = True) -> Student:
         """Build a student from raw typed input. Cleans it, then applies the entry-only age rule."""
         student = cls(
             student_id=clean_student_id(student_id),
             first_name=_tidy(first_name, "first_name"),
             last_name=_tidy(last_name, "last_name"),
-            dob=_parse_dob(dob),
+            dob=_parse_dob(dob) if dob is not None else None,
             sex=parse_enum(Sex, sex, "sex"),
             is_active=is_active,
         )
-        age = student.age()
-        if not MIN_ENTRY_AGE <= age <= MAX_ENTRY_AGE:
-            raise ValidationError(f"dob gives an age of {age}; expected {MIN_ENTRY_AGE}-{MAX_ENTRY_AGE}")
+        if student.dob is not None:
+            age = student.age()
+            if not MIN_ENTRY_AGE <= age <= MAX_ENTRY_AGE:
+                raise ValidationError(f"dob gives an age of {age}; expected {MIN_ENTRY_AGE}-{MAX_ENTRY_AGE}")
         return student
 
     @classmethod
@@ -168,7 +170,8 @@ class Student:
         instead of silently putting a value in the wrong field.
         """
         student_id, first_name, last_name, dob, sex, is_active, _created_at = row
-        return cls(student_id, first_name, last_name, date.fromisoformat(dob), Sex(sex), bool(is_active))
+        parsed_dob = date.fromisoformat(dob) if dob is not None else None
+        return cls(student_id, first_name, last_name, parsed_dob, Sex(sex), bool(is_active))
 
     @property
     def full_name(self) -> str:
@@ -179,6 +182,8 @@ class Student:
 
         A 29 February birthday counts as 1 March in years with no 29 February.
         """
+        if self.dob is None:
+            raise ValidationError("dob is unknown for this student")
         on = on or _today()
         if on < self.dob:
             raise ValidationError("cannot work out an age before the date of birth")
@@ -199,8 +204,8 @@ CREATE TABLE IF NOT EXISTS students (
     last_name   TEXT NOT NULL
                 CHECK (last_name = trim(last_name, char(32, 9, 10, 13))
                        AND length(last_name) BETWEEN 1 AND {NAME_MAX_LENGTH}),
-    dob         TEXT NOT NULL
-                CHECK (date(dob) = dob AND dob >= '{MIN_DOB.isoformat()}'),
+    dob         TEXT
+                CHECK (dob IS NULL OR (date(dob) = dob AND dob >= '{MIN_DOB.isoformat()}')),
     sex         TEXT NOT NULL
                 CHECK (sex IN ({_sql_list([s.value for s in Sex])})),
     is_active   INTEGER NOT NULL DEFAULT 1
@@ -208,19 +213,30 @@ CREATE TABLE IF NOT EXISTS students (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 ) STRICT;
 
--- Backstop for exact (ASCII) duplicates. Accented names are caught in Python (SQLite's
--- lower() only understands A-Z), see StudentRepository._refuse_same_person.
+-- Backstop for exact (ASCII) duplicates when dob is known. Accented names are caught in Python
+-- (SQLite's lower() only understands A-Z), see StudentRepository._refuse_same_person.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_students_person
     ON students (lower(first_name), lower(last_name), dob);
 
 DROP TRIGGER IF EXISTS students_dob_in_past;
 CREATE TRIGGER students_dob_in_past BEFORE INSERT ON students
-WHEN NEW.dob >= date('now', 'localtime')   -- local time, same clock as Python's date.today()
+WHEN NEW.dob IS NOT NULL AND NEW.dob >= date('now', 'localtime')
+BEGIN SELECT RAISE(ABORT, 'dob must be in the past'); END;
+
+DROP TRIGGER IF EXISTS students_dob_in_past_on_update;
+CREATE TRIGGER students_dob_in_past_on_update BEFORE UPDATE OF dob ON students
+WHEN NEW.dob IS NOT NULL AND NEW.dob >= date('now', 'localtime')
 BEGIN SELECT RAISE(ABORT, 'dob must be in the past'); END;
 
 DROP TRIGGER IF EXISTS students_lock_identity;
 CREATE TRIGGER students_lock_identity
-BEFORE UPDATE OF student_id, first_name, last_name, dob, sex, created_at ON students
+BEFORE UPDATE OF student_id, first_name, last_name, sex, created_at ON students
+BEGIN SELECT RAISE(ABORT, 'student identity details are locked'); END;
+
+DROP TRIGGER IF EXISTS students_lock_dob;
+CREATE TRIGGER students_lock_dob
+BEFORE UPDATE OF dob ON students
+WHEN OLD.dob IS NOT NULL OR NEW.dob IS NULL
 BEGIN SELECT RAISE(ABORT, 'student identity details are locked'); END;
 
 DROP TRIGGER IF EXISTS students_no_delete;
@@ -248,6 +264,9 @@ class StudentRepository(Repository):
 
     def add(self, student: Student) -> None:
         """Save a new student. Raises DuplicateError if the ID or the person already exists."""
+        if not isinstance(student, Student):
+            raise ValidationError("only Student objects can be added")
+        dob_iso = student.dob.isoformat() if student.dob is not None else None
         try:
             with self._db.transaction() as conn:
                 self._refuse_same_person(conn, student)
@@ -255,13 +274,32 @@ class StudentRepository(Repository):
                     "INSERT INTO students (student_id, first_name, last_name, dob, sex, is_active) "
                     "VALUES (?, ?, ?, ?, ?, ?)",  # ? placeholders: values are never pasted into SQL
                     (student.student_id, student.first_name, student.last_name,
-                     student.dob.isoformat(), student.sex.value, int(student.is_active)),
+                     dob_iso, student.sex.value, int(student.is_active)),
                 )
         except sqlite3.IntegrityError as exc:
             raise self._translate(exc, student) from None
 
+    def set_dob(self, student_id: str, dob: str) -> Student:
+        """Record a student's date of birth once it becomes known (locked once set)."""
+        current = self.get(student_id)
+        parsed = _parse_dob(dob)
+        updated = replace(current, dob=parsed)
+        age = updated.age()
+        if not MIN_ENTRY_AGE <= age <= MAX_ENTRY_AGE:
+            raise ValidationError(f"dob gives an age of {age}; expected {MIN_ENTRY_AGE}-{MAX_ENTRY_AGE}")
+        try:
+            with self._db.transaction() as conn:
+                self._refuse_same_person(conn, updated)
+                conn.execute(
+                    "UPDATE students SET dob = ? WHERE student_id = ?",
+                    (parsed.isoformat(), updated.student_id),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise self._translate(exc, updated) from None
+        return updated
+
     def set_active(self, student_id: str, active: bool) -> None:
-        """The only change allowed on an existing student."""
+        """Activate or deactivate an existing student."""
         if not isinstance(active, bool):  # int('no') / 5 would otherwise leak raw errors
             raise ValidationError("active must be True or False")
         student_id = clean_student_id(student_id)
@@ -303,7 +341,10 @@ class StudentRepository(Repository):
 
         Done in Python because SQLite's lower() cannot fold 'É' to 'é'. Only students born on
         the same day are compared, so this stays tiny. Same ID is left to the primary key.
+        When DOB is unknown (None), two students may share a name without being treated as the same person.
         """
+        if student.dob is None:
+            return
         wanted = (student.first_name.casefold(), student.last_name.casefold())
         for student_id, first, last in conn.execute(
             "SELECT student_id, first_name, last_name FROM students WHERE dob = ?",

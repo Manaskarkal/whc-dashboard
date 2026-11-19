@@ -146,11 +146,19 @@ def test_wrong_types_raise_validation_error(build):
         build()
 
 
-@pytest.mark.parametrize("field", ["student_id", "first_name", "last_name", "dob", "sex"])
+@pytest.mark.parametrize("field", ["student_id", "first_name", "last_name", "sex"])
 def test_none_input_raises_validation_error(field):
-    """A blank form field often arrives as None; the caller gets a WhcError, not AttributeError."""
+    """A blank required field often arrives as None; the caller gets a WhcError, not AttributeError."""
     with pytest.raises(ValidationError):
         Student.new(**{**GOOD, field: None})
+
+
+def test_dob_can_be_none_when_unknown():
+    """School rolls without DOB (like All Students in ssp_data.xlsx) pass dob=None."""
+    s = Student.new(**{**GOOD, "dob": None})
+    assert s.dob is None
+    with pytest.raises(ValidationError, match="dob is unknown"):
+        s.age()
 
 
 # ==== 2. Ages and dates ==================================================================
@@ -347,6 +355,31 @@ def test_table_creation_is_repeatable_and_keeps_data(db, sam):
     StudentRepository(db)
     StudentRepository(db)
     assert len(StudentRepository(db).all()) == 1
+
+
+def test_student_without_dob_round_trips_and_can_set_dob_once(repo):
+    """A student imported with dob=None can be saved, queried, and given a DOB once later."""
+    s = Student.new("AAA0002", "Sam", "Lee", None, "Male")
+    repo.add(s)
+    loaded = repo.get("AAA0002")
+    assert loaded.dob is None
+    df = repo.to_dataframe()
+    assert df["dob"].to_list() == [None]
+    assert df.schema["dob"] == pl.Date
+
+    # Two students with the same name and unknown DOB are allowed under different IDs.
+    repo.add(Student.new("AAA0003", "Sam", "Lee", None, "Male"))
+    assert len(repo.all()) == 2
+
+    # Once DOB becomes known, set_dob records it and locks it forever.
+    updated = repo.set_dob("AAA0002", "14/03/2010")
+    assert updated.dob == date(2010, 3, 14)
+    assert repo.get("AAA0002").dob == date(2010, 3, 14)
+    with pytest.raises(ValidationError, match="locked"):
+        repo.set_dob("AAA0002", "15/03/2010")
+    # Setting AAA0003 to the same DOB as AAA0002 (same name + same DOB) is refused.
+    with pytest.raises(DuplicateError, match="already in the database"):
+        repo.set_dob("AAA0003", "14/03/2010")
 
 
 def test_triggers_are_rebuilt_on_startup(db, repo):

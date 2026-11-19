@@ -4,7 +4,7 @@ what a believable result looks like).
     Category:                 the allowed buckets (Strength, Power, Speed, ...)
     Unit:                     the allowed units (Seconds, Newtons, Level:Shuttle, ...)
     FitnessTest:              one validated test (cannot be edited once created)
-    DEFAULT_TESTS:            the standard 35-test catalogue, loaded by load_catalogue()
+    DEFAULT_TESTS:            the standard 37-test catalogue, loaded by load_catalogue()
     FitnessTestRepository:    saves and loads tests (the only code that touches the table)
 
 This is a small REFERENCE table: a handful of rows that rarely change. Later, test_results
@@ -15,7 +15,7 @@ test_id numbering (the first digit tells you the bucket):
     101-199  Power               500s  Anaerobic Endurance
     201-299  Speed               600s  Muscular Endurance
     301-399  Agility             700s  Flexibility
-                                 800s  Reaction
+    801-899  Reaction            900s  Anthropometrics
     IDs start at 1 inside each block (a block's own round number - 0, 100, 200 - is not used,
     so no ID is ever 0, which is falsy in Python and easy to lose in an `if test_id:` check).
 
@@ -51,6 +51,7 @@ import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from typing import TypeGuard
 
 import polars as pl
 
@@ -84,6 +85,7 @@ class Category(StrEnum):
     MUSCULAR_ENDURANCE = "Muscular Endurance"
     FLEXIBILITY = "Flexibility"
     REACTION = "Reaction"
+    ANTHROPOMETRICS = "Anthropometrics"
 
     @property
     def id_start(self) -> int:
@@ -103,6 +105,7 @@ _ID_START: dict[Category, int] = {
     Category.MUSCULAR_ENDURANCE: 600,
     Category.FLEXIBILITY: 700,
     Category.REACTION: 800,
+    Category.ANTHROPOMETRICS: 900,
 }
 
 
@@ -132,7 +135,7 @@ def _check_test_id(test_id: object) -> None:
         raise ValidationError("test_id must be a whole number")
 
 
-def _is_plain_number(value: object) -> bool:
+def _is_plain_number(value: object) -> TypeGuard[int | float]:
     """A real, finite int or float. Not True/False (they are ints in Python), text, NaN or inf."""
     return (
         isinstance(value, (int, float))
@@ -266,7 +269,7 @@ class FitnessTest:
 # Arguments: id, name, category, unit, min_value, max_value (no range for Level:Shuttle).
 _S, _P, _SP, _AG = Category.STRENGTH, Category.POWER, Category.SPEED, Category.AGILITY
 _AE, _AN, _ME = Category.AEROBIC_ENDURANCE, Category.ANAEROBIC_ENDURANCE, Category.MUSCULAR_ENDURANCE
-_FL, _RE = Category.FLEXIBILITY, Category.REACTION
+_FL, _RE, _ANT = Category.FLEXIBILITY, Category.REACTION, Category.ANTHROPOMETRICS
 
 DEFAULT_TESTS: tuple[FitnessTest, ...] = (
     # Strength (1-99)
@@ -314,6 +317,9 @@ DEFAULT_TESTS: tuple[FitnessTest, ...] = (
     FitnessTest(701, "Sit-and-Reach Test", _FL, Unit.CENTIMETRES, -30, 50),
     # Reaction (801-899)
     FitnessTest(801, "Reaction Time Ruler Drop Test", _RE, Unit.CENTIMETRES, 1, 40),
+    # Anthropometrics (901-999)
+    FitnessTest(901, "Height", _ANT, Unit.CENTIMETRES, 100, 230),
+    FitnessTest(902, "Weight", _ANT, Unit.KILOGRAMS, 20, 200),
 )
 
 # ---- The table (SQL) ---------------------------------------------------------------

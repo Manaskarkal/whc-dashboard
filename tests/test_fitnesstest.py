@@ -183,6 +183,7 @@ def test_the_blocks_you_asked_for():
     assert Category.MUSCULAR_ENDURANCE.id_start == 600
     assert Category.FLEXIBILITY.id_start == 700
     assert Category.REACTION.id_start == 800
+    assert Category.ANTHROPOMETRICS.id_start == 900
 
 
 @pytest.mark.parametrize("test_id, accepted", [
@@ -303,7 +304,8 @@ def test_filter_by_category(loaded):
     assert [t.test_id for t in power] == [101, 102, 103, 104, 105]
     assert {t.category for t in power} == {Category.POWER}
     assert [t.test_id for t in loaded.all(category=Category.REACTION)] == [801]
-    assert len(loaded.all()) == 35
+    assert [t.test_id for t in loaded.all(category=Category.ANTHROPOMETRICS)] == [901, 902]
+    assert len(loaded.all()) == 37
 
 
 def test_filter_by_unknown_category_is_refused(loaded):
@@ -503,8 +505,8 @@ def test_a_refused_raw_insert_leaves_nothing_behind(db, one):
 
 
 # ==== 5. The standard catalogue =============================================================
-def test_catalogue_has_the_35_requested_tests():
-    assert len(DEFAULT_TESTS) == 35
+def test_catalogue_has_the_37_requested_tests():
+    assert len(DEFAULT_TESTS) == 37
 
 
 def test_catalogue_has_no_duplicate_ids_or_names():
@@ -564,30 +566,34 @@ EXPECTED = [
     ("Pull Up Test (1-Minute)", "Muscular Endurance", "Reps"),
     ("Sit-and-Reach Test", "Flexibility", "Centimetres"),
     ("Reaction Time Ruler Drop Test", "Reaction", "Centimetres"),
+    ("Height", "Anthropometrics", "Centimetres"),
+    ("Weight", "Anthropometrics", "Kilograms"),
 ]
 
 
 # name -> (min, max); Level:Shuttle tests are deliberately absent (they have no range).
 EXPECTED_RANGES = {
-    "Isometric Mid-Thigh Pull Peak": (300, 6000),
-    "Isometric Mid-Thigh Pull Relative": (1, 6),
+    "Isometric Mid-Thigh Pull Peak": (300, 7000),
+    "Isometric Mid-Thigh Pull Relative": (1, 7),
     "Nordic Hamstring Left": (50, 800), "Nordic Hamstring Right": (50, 800),
     "Adduction Left": (50, 800), "Adduction Right": (50, 800),
     "Abduction Left": (50, 800), "Abduction Right": (50, 800),
     "1RM Back Squat": (20, 350), "1RM Bench Press": (20, 250), "1RM Trap Bar Deadlift": (30, 400),
     "3RM Back Squat": (20, 320), "3RM Bench Press": (20, 230), "3RM Trap Bar Deadlift": (30, 380),
-    "Counter Movement Jump Height": (10, 90),
+    "Counter Movement Jump Height": (5, 90),
     "Counter Movement Jump Power": (15, 80),
     "Counter Movement Jump Relative Strength Index (RSI)": (0.1, 1.2),
     "Hop Jump Relative Strength Index (RSI)": (0.3, 5),
     "Standing Long Jump (Broad Jump)": (0.8, 3.6),
-    "5 Metre Sprint": (0.8, 2.0), "10 Metre Sprint": (1.4, 3.0), "20 Metre Sprint": (2.6, 4.5),
-    "5-0-5 Agility Test Left": (2.0, 3.8), "5-0-5 Agility Test Right": (2.0, 3.8),
-    "NBA Lane Agility Test": (8, 18),
+    "5 Metre Sprint": (0.8, 3.5), "10 Metre Sprint": (1.2, 6.0), "20 Metre Sprint": (2.2, 8.0),
+    "5-0-5 Agility Test Left": (2.0, 8.0), "5-0-5 Agility Test Right": (2.0, 8.0),
+    "NBA Lane Agility Test": (8, 20),
     "Cooper 12-Minute Run": (1000, 4500), "1.6k/Mile Run": (220, 1200), "2k Run": (300, 1500),
     "Push Up Test (1-Minute)": (0, 120), "Pull Up Test (1-Minute)": (0, 60),
     "Sit-and-Reach Test": (-30, 50),
     "Reaction Time Ruler Drop Test": (1, 40),
+    "Height": (100, 230),
+    "Weight": (20, 200),
 }
 
 
@@ -618,7 +624,7 @@ def test_load_catalogue_saves_everything(loaded):
 def test_load_catalogue_is_repeatable_and_does_not_duplicate(loaded):
     loaded.load_catalogue()
     loaded.load_catalogue()
-    assert len(loaded.all()) == 35
+    assert len(loaded.all()) == 37
 
 
 def test_load_catalogue_keeps_other_tests_and_fills_the_gaps(repo):
@@ -626,7 +632,7 @@ def test_load_catalogue_keeps_other_tests_and_fills_the_gaps(repo):
     repo.add(make(106, "Depth Jump", "Power", "Centimetres"))  # my own extra test
     repo.add(DEFAULT_TESTS[0])  # one catalogue test already there
     repo.load_catalogue()
-    assert len(repo.all()) == 36
+    assert len(repo.all()) == 38
     assert repo.get(106).test_name == "Depth Jump"
 
 
@@ -635,7 +641,7 @@ def test_load_catalogue_respects_a_rename(loaded):
     loaded.rename(101, "CMJ Height")
     loaded.load_catalogue()
     assert loaded.get(101).test_name == "CMJ Height"
-    assert len(loaded.all()) == 35
+    assert len(loaded.all()) == 37
 
 
 def test_load_catalogue_refuses_to_overwrite_a_conflicting_row(repo):
@@ -692,7 +698,7 @@ def test_dataframe_column_names_and_order(repo):
 def test_dataframe_category_filter(loaded):
     df = loaded.to_dataframe(category="Speed")
     assert df["test_id"].to_list() == [201, 202, 203]
-    assert len(loaded.to_dataframe()) == 35
+    assert len(loaded.to_dataframe()) == 37
 
 
 def test_dataframe_enum_lists_every_category_even_if_unused(one):
@@ -727,6 +733,7 @@ def test_a_unit_missing_from_an_old_database_is_added_on_startup(db, repo):
 def test_a_changed_block_in_an_old_database_stops_start_up(db, repo):
     """If a category's block differs from what the code says, IDs would be renumbered: refuse."""
     with db.transaction() as conn:
+        conn.execute("DELETE FROM test_categories WHERE name = 'Anthropometrics'")
         conn.execute("UPDATE test_categories SET id_start = 900 WHERE name = 'Reaction'")
     with pytest.raises(RuntimeError, match="Reaction IDs starting at 900"):
         FitnessTestRepository(db)
@@ -1002,7 +1009,7 @@ def test_drop_tables_is_the_documented_fix(db):
     FitnessTestRepository.drop_tables(db)
     fresh = FitnessTestRepository(db)  # now builds the new layout
     fresh.load_catalogue()
-    assert len(fresh.all()) == 35
+    assert len(fresh.all()) == 37
     assert fresh.get(401).unit is Unit.LEVEL_SHUTTLE
 
 
