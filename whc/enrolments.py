@@ -1,6 +1,6 @@
 """enrolments.py - one row per student, per season, per sport.
 
-    Sport:               allowed sports
+    Sport:               default seeded sports (additional sports can be added via add_sport())
     Grade:               allowed school years (each has a numeric `level`, 7-12)
     Enrolment:           one validated enrolment (cannot be edited once created)
     EnrolmentRepository: saves and loads enrolments (the only code that touches the table)
@@ -17,11 +17,15 @@ Business rules enforced (each one has tests):
     4. A student has ONE grade per season (several sports, same grade).
     5. A grade can repeat but never go backwards between seasons.
     6. Inactive students cannot get new enrolments.
+    7. Sports are database-driven: Lead Coaches can add new sports via `add_sport()`
+       with zero code changes.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, replace
 from datetime import date
 from enum import StrEnum
@@ -35,12 +39,15 @@ from whc.students import (
     StudentRepository,
     clean_student_id,
     parse_enum,
+    require_text,
 )
 
 # ---- Settings (change rules here) --------------------------------------------------
 MIN_SEASON_YEAR = 2000
 MAX_SEASON_YEAR = 2100  # broad guard for raw SQL; the real "future" rule is a trigger
 MAX_YEARS_AHEAD = 1  # allow planning one season ahead
+SPORT_MAX_LENGTH = 50
+SPORT_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9 '&/-]*")
 
 # Grade/age rule. A student's "season age" is season_year - birth_year (the age they turn
 # during that calendar year). A Year N student is typically N+5 or N+6 (Year 7 -> 12 or 13).
@@ -51,7 +58,7 @@ AGE_OFFSET_MAX = 8
 
 
 class Sport(StrEnum):
-    """Allowed sports. Add one here and it is added to the database on the next start-up."""
+    """Default seeded sports. Extra sports can be added to the DB at runtime via add_sport()."""
 
     AFL = "AFL"
     ATHLETICS = "Athletics"
@@ -69,7 +76,7 @@ class Sport(StrEnum):
 
 
 class Grade(StrEnum):
-    """Allowed school years. Edit this list if the program covers other years."""
+    """Allowed school years (fixed Year 7-12)."""
 
     YEAR_7 = "Year 7"
     YEAR_8 = "Year 8"
@@ -93,18 +100,33 @@ def _latest_allowed_year() -> int:
     return _today().year + MAX_YEARS_AHEAD
 
 
+def _tidy_sport_name(value: object) -> str:
+    """Clean a sport name. Matches default Sport enum values case-insensitively."""
+    raw = unicodedata.normalize("NFC", " ".join(require_text(value, "sport").split()))
+    for member in Sport:
+        if member.value.casefold() == raw.casefold():
+            return member.value
+    if not raw or len(raw) > SPORT_MAX_LENGTH or not SPORT_NAME_PATTERN.fullmatch(raw):
+        raise ValidationError(
+            f"sport must be 1-{SPORT_MAX_LENGTH} characters: letters, digits, single spaces "
+            "and ' & / - only, starting with a letter"
+        )
+    return raw
+
+
 # ---- The Enrolment (value object) --------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class Enrolment:
     """One student's participation in one sport for one season.
 
     The ID is None until the repository saves it; the database generates it.
+    `sport` is a clean sport name (matches Sport enum values or custom DB-added sports).
     """
 
     enrolment_id: int | None
     student_id: str
     season_year: int
-    sport: Sport
+    sport: str
     grade: Grade
 
     def __post_init__(self) -> None:
@@ -123,8 +145,17 @@ class Enrolment:
         latest = _latest_allowed_year()
         if not MIN_SEASON_YEAR <= self.season_year <= latest:
             raise ValidationError(f"season_year must be between {MIN_SEASON_YEAR} and {latest}")
-        if not isinstance(self.sport, Sport):
-            raise ValidationError("sport must be a Sport value")
+        if (
+            not isinstance(self.sport, str)
+            or len(self.sport) > SPORT_MAX_LENGTH
+            or not SPORT_NAME_PATTERN.fullmatch(self.sport)
+            or self.sport != self.sport.strip()
+            or "  " in self.sport
+        ):
+            raise ValidationError(
+                f"sport must be 1-{SPORT_MAX_LENGTH} characters: letters, digits, single spaces "
+                "and ' & / - only, starting with a letter"
+            )
         if not isinstance(self.grade, Grade):
             raise ValidationError("grade must be a Grade value")
 
@@ -135,7 +166,7 @@ class Enrolment:
             enrolment_id=None,
             student_id=clean_student_id(student_id),
             season_year=season_year,
-            sport=parse_enum(Sport, sport, "sport"),
+            sport=_tidy_sport_name(sport),
             grade=parse_enum(Grade, grade, "grade"),
         )
 
@@ -146,39 +177,37 @@ class Enrolment:
         Unpacks all 6 columns on purpose, so a changed _SELECT fails loudly.
         """
         enrolment_id, student_id, season_year, sport, grade, _created_at = row
-        return cls(enrolment_id, student_id, int(season_year), Sport(sport), Grade(grade))
+        return cls(enrolment_id, student_id, int(season_year), sport, Grade(grade))
 
     @property
     def season_label(self) -> str:
-        return f"{self.season_year} {self.sport.value}"
+        return f"{self.season_year} {self.sport}"
 
 
 # ---- The table (SQL) ---------------------------------------------------------------
-# Sports and grades are small LOOKUP TABLES filled from the enums above every start-up.
-# Why not a CHECK (sport IN (...))? A CHECK is frozen into an existing table, so adding a
-# sport to the enum would be refused by an old whc.db. A lookup row is just an INSERT.
-#
-# Two conditions are used by more than one trigger, so they are written once here.
 _BIRTH_YEAR = "(SELECT CAST(substr(dob, 1, 4) AS INTEGER) FROM students WHERE student_id = NEW.student_id)"
 _NEW_LEVEL = "(SELECT level FROM grades WHERE name = NEW.grade)"
 
-# Fires when the grade does NOT fit the age. COALESCE(..., 1): if the student or grade is
-# unknown the answer is NULL, so we say "fits" and let the foreign key report the real problem.
 _GRADE_DOES_NOT_FIT_AGE = f"""NOT COALESCE(
         ((NEW.season_year - {_BIRTH_YEAR})
          BETWEEN {_NEW_LEVEL} + {AGE_OFFSET_MIN} AND {_NEW_LEVEL} + {AGE_OFFSET_MAX}), 1)"""
 
-# Fires when another season of the same student has a higher grade earlier, or a lower grade later.
 _GRADE_GOES_BACKWARDS = f"""EXISTS (
         SELECT 1 FROM enrolments e JOIN grades g ON g.name = e.grade
         WHERE e.student_id = NEW.student_id
           AND ((e.season_year < NEW.season_year AND g.level > {_NEW_LEVEL})
             OR (e.season_year > NEW.season_year AND g.level < {_NEW_LEVEL})))"""
 
-# Triggers are DROPPED and re-created every start-up so they always match the settings
-# above (CREATE TRIGGER IF NOT EXISTS would keep an old, out-of-date version forever).
 _SCHEMA_SQL = f"""
-CREATE TABLE IF NOT EXISTS sports (name TEXT PRIMARY KEY) STRICT;
+CREATE TABLE IF NOT EXISTS sports (
+    name TEXT PRIMARY KEY
+         CHECK (name = trim(name, char(32, 9, 10, 13))
+                AND length(name) BETWEEN 1 AND {SPORT_MAX_LENGTH}
+                AND name GLOB '[A-Za-z]*'
+                AND name NOT LIKE '%  %')
+) STRICT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_sports_name ON sports (lower(name));
 
 CREATE TABLE IF NOT EXISTS grades (
     name  TEXT PRIMARY KEY,
@@ -198,6 +227,7 @@ CREATE TABLE IF NOT EXISTS enrolments (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_enrolments_student_year_sport
     ON enrolments (student_id, season_year, sport);
 CREATE INDEX IF NOT EXISTS ix_enrolments_season ON enrolments (season_year);
+CREATE INDEX IF NOT EXISTS ix_enrolments_student_year ON enrolments (student_id, season_year);
 
 -- Retired in this version (its job is now done by enrolments_grade_fits_age).
 DROP TRIGGER IF EXISTS enrolments_season_after_birth;
@@ -269,7 +299,7 @@ _DATAFRAME_RAW_SCHEMA = {
 
 # ---- The repository ----------------------------------------------------------------
 class EnrolmentRepository(Repository):
-    """Saves and loads enrolments. Results will later point at enrolment_id."""
+    """Saves and loads enrolments."""
 
     def __init__(self, db: Database) -> None:
         StudentRepository(db)  # the parent table must exist first; safe to repeat
@@ -281,17 +311,37 @@ class EnrolmentRepository(Repository):
     def schema_sql(self) -> str:
         return _SCHEMA_SQL
 
+    def sports(self) -> list[str]:
+        """Return all available sports from the database lookup table, sorted."""
+        return [row[0] for row in self._db.query("SELECT name FROM sports ORDER BY name")]
+
+    def add_sport(self, name: str) -> str:
+        """Add a new sport to the database lookup table (no code changes needed)."""
+        clean = _tidy_sport_name(name)
+        try:
+            with self._db.transaction() as conn:
+                conn.execute("INSERT INTO sports (name) VALUES (?)", (clean,))
+        except sqlite3.IntegrityError as exc:
+            if exc.sqlite_errorname in ("SQLITE_CONSTRAINT_PRIMARYKEY", "SQLITE_CONSTRAINT_UNIQUE"):
+                raise DuplicateError(f"sport '{clean}' already exists") from None
+            raise ValidationError(f"database refused sport '{clean}': {exc}") from None
+        return clean
+
     def add(self, enrolment: Enrolment) -> Enrolment:
         """Insert one enrolment and return it with the database-generated ID."""
+        if not isinstance(enrolment, Enrolment):
+            raise ValidationError("only Enrolment objects can be added")
         if enrolment.enrolment_id is not None:
             raise ValidationError("enrolment_id is assigned by the database; do not supply one")
+        canonical_sport = self._resolve_sport(enrolment.sport)
+        enrolment = replace(enrolment, sport=canonical_sport)
         try:
             with self._db.transaction() as conn:
                 cursor = conn.execute(
                     "INSERT INTO enrolments (student_id, season_year, sport, grade) "
                     "VALUES (?, ?, ?, ?)",
                     (enrolment.student_id, enrolment.season_year,
-                     enrolment.sport.value, enrolment.grade.value),
+                     enrolment.sport, enrolment.grade.value),
                 )
                 new_id = cursor.lastrowid
         except sqlite3.IntegrityError as exc:
@@ -315,10 +365,10 @@ class EnrolmentRepository(Repository):
         return [Enrolment.from_row(row) for row in rows]
 
     def to_dataframe(self, *, season_year: int | None = None) -> pl.DataFrame:
-        """The table as a Polars dataframe with proper Enum/Datetime types."""
+        """The table as a Polars dataframe with dynamic Enum/Datetime types."""
         df = pl.DataFrame(self._rows(season_year=season_year), schema=_DATAFRAME_RAW_SCHEMA, orient="row")
         return df.with_columns(
-            pl.col("sport").cast(pl.Enum([s.value for s in Sport])),
+            pl.col("sport").cast(pl.Enum(self.sports())),
             pl.col("grade").cast(pl.Enum([g.value for g in Grade])),
             pl.col("created_at").str.to_datetime("%Y-%m-%dT%H:%M:%SZ"),
         )
@@ -327,9 +377,7 @@ class EnrolmentRepository(Repository):
         """Correct a grade. This is the only change allowed on an existing enrolment.
 
         A grade belongs to the student's SEASON, not to one sport, so this corrects every
-        enrolment that student has in the same season in one go. (Changing just one would
-        leave the student with two grades in one season.) The triggers still check that the
-        new grade fits the student's age and does not go backwards.
+        enrolment that student has in the same season in one go.
         """
         _check_enrolment_id(enrolment_id)
         new_grade = grade if isinstance(grade, Grade) else parse_enum(Grade, grade, "grade")
@@ -347,12 +395,14 @@ class EnrolmentRepository(Repository):
             raise NotFoundError(f"enrolment_id {enrolment_id} does not exist")
 
     def delete(self, enrolment_id: int) -> None:
-        """Delete an enrolment only while no results reference it (FK RESTRICT)."""
+        """Delete an enrolment only while it does not leave tested seasons without an enrolment."""
         _check_enrolment_id(enrolment_id)
         try:
             with self._db.transaction() as conn:
                 cursor = conn.execute("DELETE FROM enrolments WHERE enrolment_id = ?", (enrolment_id,))
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            if exc.sqlite_errorname == "SQLITE_CONSTRAINT_TRIGGER":
+                raise ValidationError(str(exc)) from None
             raise ValidationError(
                 f"cannot delete enrolment_id {enrolment_id} while test results are recorded for it"
             ) from None
@@ -360,6 +410,14 @@ class EnrolmentRepository(Repository):
             raise NotFoundError(f"enrolment_id {enrolment_id} does not exist")
 
     # -- private helpers --
+    def _resolve_sport(self, sport: str) -> str:
+        """Match a sport name case-insensitively against the live `sports` table."""
+        rows = self._db.query("SELECT name FROM sports WHERE lower(name) = lower(?)", (sport,))
+        if not rows:
+            allowed = self.sports()
+            raise ValidationError(f"sport must be one of {allowed} (or add it via add_sport())")
+        return rows[0][0]
+
     def _rows(self, *, student_id: str | None = None, season_year: int | None = None) -> list[tuple]:
         """The ONE place that builds the SELECT, so every read orders and filters the same way."""
         conditions: list[str] = []
@@ -376,7 +434,7 @@ class EnrolmentRepository(Repository):
         )
 
     def _fill_lookup_tables(self) -> None:
-        """Make sure every Sport and Grade in the enums exists in the database (safe to repeat)."""
+        """Make sure every default Sport and Grade exists in the database (safe to repeat)."""
         with self._db.transaction() as conn:
             conn.executemany("INSERT OR IGNORE INTO sports (name) VALUES (?)",
                              [(s.value,) for s in Sport])
@@ -384,11 +442,7 @@ class EnrolmentRepository(Repository):
                              [(g.value, g.level) for g in Grade])
 
     def _check_table_is_current(self) -> None:
-        """Stop with a clear message if whc.db still has the old enrolments table.
-
-        The old table used CHECK lists for sport/grade instead of lookup tables, and
-        CREATE TABLE IF NOT EXISTS cannot upgrade it.
-        """
+        """Stop with a clear message if whc.db still has an old enrolments table."""
         linked_tables = {row[2] for row in self._db.query("PRAGMA foreign_key_list(enrolments)")}
         if not {"sports", "grades"} <= linked_tables:
             raise RuntimeError(
@@ -409,7 +463,7 @@ class EnrolmentRepository(Repository):
         if code == "SQLITE_CONSTRAINT_UNIQUE":
             return DuplicateError(
                 f"student_id {enrolment.student_id} is already enrolled in "
-                f"{enrolment.sport.value} for {enrolment.season_year}"
+                f"{enrolment.sport} for {enrolment.season_year}"
             )
         if code == "SQLITE_CONSTRAINT_TRIGGER":
             return ValidationError(str(exc))  # the rule's own message, e.g. 'grade cannot go backwards...'

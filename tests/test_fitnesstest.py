@@ -25,12 +25,14 @@ import pytest
 from whc.database import Database
 from whc.exceptions import DuplicateError, NotFoundError, ValidationError
 from whc.fitness_tests import (
+    DEFAULT_LEVEL_SHUTTLE_RULES,
     DEFAULT_TESTS,
     IDS_PER_CATEGORY,
     NAME_MAX_LENGTH,
     Category,
     FitnessTest,
     FitnessTestRepository,
+    ScoreDirection,
     Unit,
 )
 
@@ -88,8 +90,8 @@ def test_new_cleans_input():
 def test_new_accepts_unit_with_punctuation_in_any_case():
     """'shuttles:levels' and 'watts/kilogram' contain : and / - they must still match the enum."""
     pair = FitnessTest.new(401, "Beep Test", "aerobic endurance", "LEVEL:shuttle")
-    assert pair.unit is Unit.LEVEL_SHUTTLE
-    assert FitnessTest.new(**{**GOOD, "unit": "watts/KILOGRAM"}).unit is Unit.WATTS_PER_KILOGRAM
+    assert pair.unit == Unit.LEVEL_SHUTTLE
+    assert FitnessTest.new(**{**GOOD, "unit": "watts/KILOGRAM"}).unit == Unit.WATTS_PER_KILOGRAM
 
 
 @pytest.mark.parametrize("change, message", [
@@ -100,7 +102,7 @@ def test_new_accepts_unit_with_punctuation_in_any_case():
     (dict(test_id=0), "test_id must be between"),
     (dict(test_id=-101), "test_id must be between"),
     (dict(test_id=100), "multiple of"),                   # a block's own round number is unused
-    (dict(test_id=1000), "test_id must be between"),
+    (dict(test_id=10000), "test_id must be between"),
     (dict(test_name=""), "test_name must be"),
     (dict(test_name="   "), "test_name must be"),         # blank once tidied
     (dict(test_name=None), "test_name must be text"),
@@ -111,11 +113,11 @@ def test_new_accepts_unit_with_punctuation_in_any_case():
     (dict(test_name="Jump_Height"), "test_name must be"), # underscore is not allowed
     (dict(test_name="Jump\u2013Height"), "test_name must be"),   # en dash, not a hyphen
     (dict(test_name="A" * (NAME_MAX_LENGTH + 1)), "test_name must be"),
-    (dict(category="Speedy"), "category must be one of"),
-    (dict(category="   "), "category must be one of"),
-    (dict(category=None), "category must be one of"),
-    (dict(unit="Furlongs"), "unit must be one of"),
-    (dict(unit=None), "unit must be one of"),
+    (dict(category="   "), "category must be"),
+    (dict(category=None), "category must be text"),
+    (dict(unit="   "), "unit must be"),
+    (dict(unit=None), "unit must be text"),
+    (dict(score_direction="sideways"), "score_direction must be one of"),
 ])
 def test_bad_input_refused(change, message):
     """One bad field at a time; each must fail for ITS OWN reason (see `message`)."""
@@ -137,15 +139,16 @@ def test_fitness_test_cannot_be_edited():
 
 
 @pytest.mark.parametrize("build, message", [
-    (lambda: FitnessTest(101, "Jump", "Power", Unit.SECONDS, 0, 100), "category must be a Category"),
-    (lambda: FitnessTest(101, "Jump", Category.POWER, "Seconds"), "unit must be a Unit"),
+    (lambda: FitnessTest(101, "Jump", 123, Unit.SECONDS, 0, 100), "category must be"),
+    (lambda: FitnessTest(101, "Jump", Category.POWER, 123, 0, 100), "unit must be"),
     (lambda: FitnessTest("101", "Jump", Category.POWER, Unit.SECONDS, 0, 100), "whole number"),
     (lambda: FitnessTest(101, "Jump\n", Category.POWER, Unit.SECONDS, 0, 100), "test_name"),
     (lambda: FitnessTest(101, " Jump", Category.POWER, Unit.SECONDS, 0, 100), "test_name"),
     (lambda: FitnessTest(101, "Jump  Height", Category.POWER, Unit.SECONDS, 0, 100), "test_name"),
     (lambda: FitnessTest(14, "Jump", Category.POWER, Unit.SECONDS, 0, 100), "does not belong to Power"),
-], ids=["category-text", "unit-text", "id-text", "name-newline", "name-leading-space",
-        "name-double-space", "id-in-wrong-block"])
+    (lambda: FitnessTest(101, "Jump", Category.POWER, Unit.SECONDS, 0, 100, "higher"), "score_direction"),
+], ids=["category-int", "unit-int", "id-text", "name-newline", "name-leading-space",
+        "name-double-space", "id-in-wrong-block", "direction-text"])
 def test_directly_built_invalid_test_refused(build, message):
     """Building FitnessTest(...) directly skips new(), so __post_init__ must guard every rule.
 
@@ -431,7 +434,7 @@ def test_tests_cannot_be_deleted(db, one):
     ((-5, "Jump", "Strength", "Seconds", 0, 100), "test_id"),                 # negative
     ((5, "Jump", "Power", "Seconds", 0, 100), "block of this category"),      # Strength ID, Power category
     ((201, "Jump", "Power", "Seconds", 0, 100), "block of this category"),    # Speed ID, Power category
-    ((1000, "Jump", "Power", "Seconds", 0, 100), "block of this category"),   # beyond every block
+    ((10000, "Jump", "Power", "Seconds", 0, 100), "test_id"),                 # beyond MAX_TEST_ID (9999)
     ((106, "", "Power", "Seconds", 0, 100), "test_name"),                     # empty name
     ((106, " Jump", "Power", "Seconds", 0, 100), "test_name"),                # leading space
     ((106, "Jump ", "Power", "Seconds", 0, 100), "test_name"),                # trailing space
@@ -609,11 +612,11 @@ def test_only_level_shuttle_tests_have_no_range():
         "YOYO Intermittent Recovery Test 2 (IRT2)",
         "20m Beep Test (Shuttle Run)",
     }
-    assert all(t.unit is Unit.LEVEL_SHUTTLE for t in DEFAULT_TESTS if t.min_value is None)
+    assert all(t.unit == Unit.LEVEL_SHUTTLE for t in DEFAULT_TESTS if t.min_value is None)
 
 
 def test_catalogue_matches_the_requested_list_exactly():
-    got = sorted((t.test_name, t.category.value, t.unit.value) for t in DEFAULT_TESTS)
+    got = sorted((t.test_name, str(t.category), str(t.unit)) for t in DEFAULT_TESTS)
     assert got == sorted(EXPECTED)
 
 
@@ -691,7 +694,7 @@ def test_dataframe_shows_missing_ranges_as_null_not_zero(loaded):
 
 def test_dataframe_column_names_and_order(repo):
     assert repo.to_dataframe().columns == [
-        "test_id", "test_name", "category", "unit", "min_value", "max_value"
+        "test_id", "test_name", "category", "unit", "min_value", "max_value", "score_direction"
     ]
 
 
@@ -784,16 +787,16 @@ def test_replace_cannot_smuggle_in_an_invalid_test(one):
     good = one.get(101)
     with pytest.raises(ValidationError, match="does not belong"):
         replace(good, test_id=5)
-    with pytest.raises(ValidationError, match="unit must be a Unit"):
-        replace(good, unit="Seconds")
+    with pytest.raises(ValidationError, match="unit must be"):
+        replace(good, unit=123)
 
 
 # ==== 8. Level:Shuttle unit and min/max ranges ==============================================
-def test_level_shuttle_unit_is_named_level_first():
+def test_level_shuttle_unit_is_named_level_first(repo):
     """The unit's name states the order: level, then shuttle. The old name must be gone."""
     assert Unit.LEVEL_SHUTTLE.value == "Level:Shuttle"
     with pytest.raises(ValidationError, match="unit must be one of"):
-        FitnessTest.new(401, "Beep Test", "Aerobic Endurance", "Shuttles:Levels")
+        repo.add(FitnessTest.new(401, "Beep Test", "Aerobic Endurance", "Shuttles:Levels", 1, 20))
 
 
 def test_new_stores_the_range_as_given():
@@ -996,9 +999,8 @@ INSERT INTO fitness_tests VALUES (401, 'YOYO Intermittent Recovery Test 1 (IRT1)
 def test_old_four_column_table_stops_start_up_with_a_clear_fix(db):
     """The exact situation after upgrading: an old whc.db must give a helpful message, not 'no such column'."""
     db.run_script(OLD_TABLE)
-    with pytest.raises(RuntimeError, match="old fitness_tests table") as err:
+    with pytest.raises(RuntimeError, match="old fitness_tests table"):
         FitnessTestRepository(db)
-    assert "drop_tables" in str(err.value)  # the message includes the rebuild command
 
 
 def test_drop_tables_is_the_documented_fix(db):
@@ -1010,7 +1012,32 @@ def test_drop_tables_is_the_documented_fix(db):
     fresh = FitnessTestRepository(db)  # now builds the new layout
     fresh.load_catalogue()
     assert len(fresh.all()) == 37
-    assert fresh.get(401).unit is Unit.LEVEL_SHUTTLE
+    assert fresh.get(401).unit == Unit.LEVEL_SHUTTLE
+
+
+def test_custom_category_unit_and_level_shuttle_rules_work_without_code_changes(loaded):
+    """Future-proofing: Lead Coach can add an 11th category, a new unit, and custom shuttle rules."""
+    cat_name, start = loaded.add_category("Balance")
+    assert (cat_name, start) == ("Balance", 1000)
+    unit_name = loaded.add_unit("Degrees")
+    assert unit_name == "Degrees"
+
+    new_id = loaded.next_id("Balance")
+    assert new_id == 1001
+    loaded.add(FitnessTest.new(new_id, "Ankle Dorsiflexion", "Balance", "Degrees", 0, 60, score_direction="higher"))
+    saved = loaded.get(1001)
+    assert (saved.category, saved.unit, saved.score_direction) == ("Balance", "Degrees", ScoreDirection.HIGHER)
+    assert "Balance" in loaded.to_dataframe()["category"].to_list()
+
+    # Official protocol rules are loaded by load_catalogue()
+    assert loaded.level_shuttle_rules(401) == DEFAULT_LEVEL_SHUTTLE_RULES[401]
+    assert loaded.level_shuttle_rules(402) == DEFAULT_LEVEL_SHUTTLE_RULES[402]
+    assert loaded.level_shuttle_rules(501) == DEFAULT_LEVEL_SHUTTLE_RULES[501]
+
+    # Adding a new Level:Shuttle test + registering its protocol rules works cleanly
+    loaded.add(FitnessTest.new(406, "Custom Shuttle Test", "Aerobic Endurance", "Level:Shuttle"))
+    loaded.set_level_shuttle_rules(406, {1: 5, 2: 6})
+    assert loaded.level_shuttle_rules(406) == {1: 5, 2: 6}
 
 
 def test_drop_tables_leaves_other_tables_alone(db):

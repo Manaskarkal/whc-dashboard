@@ -19,3 +19,11 @@ class DuplicateError(WhcError):
 
 class NotFoundError(WhcError):
     """The record does not exist."""
+
+
+class AuthenticationError(WhcError):
+    """Credentials, lockout status, or session token failed authentication."""
+
+
+class AuthorizationError(WhcError):
+    """The authenticated user does not have permission for this action."""

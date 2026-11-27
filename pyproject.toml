@@ -1,10 +1,13 @@
 [project]
 name = "whc-dashboard"
 version = "0.1.0"
-description = "Add your description here"
+description = "Athlete management and fitness testing analytics platform for the WHC Specialist Sports Program."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "argon2-cffi>=25.1.0",
+    "fastexcel>=0.21.0",
+    "ipykernel>=7.4.0",
     "polars>=2.1.0",
     "pydantic>=2.14.2",
 ]

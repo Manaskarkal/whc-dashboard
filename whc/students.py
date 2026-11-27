@@ -2,7 +2,7 @@
 
     Sex:                 the allowed values
 
-    Student:             one validated student (cannot be edited once created)
+    Student:             one validated student (frozen in memory)
 
     StudentRepository:   saves and loads students (the only code that touches the table)
 
@@ -12,6 +12,16 @@
 Where each rule lives:
     * Python  -> friendly, specific error messages for typed input.
     * SQL     -> the same rules again, so bad data cannot get in even if Python is bypassed.
+
+DOB & Legacy Import Policy:
+    * Every NEW student created via Student.new() MUST have a real date of birth (`dob`),
+      and SQLite's `students_require_dob_when_locked` trigger blocks `dob IS NULL` inserts
+      unless `db.legacy_import_mode()` is active (used only for one-time Phase 1c import).
+    * Legacy roster students imported with `dob = None` can be backfilled later via
+      `set_dob()` or `update_details()`. Once set, `dob` can be corrected if mistyped,
+      but can never be cleared back to NULL.
+    * `student_id` and `created_at` are permanently locked, and students can never be deleted
+      (use `set_active(student_id, False)` instead).
 """
 
 from __future__ import annotations
@@ -107,8 +117,7 @@ def _sql_list(values: list[str]) -> str:
 # ---- The Student (value object) ----------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class Student:
-    """One student. Frozen: once created it cannot be changed, which matches the rule
-    that identity details are locked. Invalid students cannot exist."""
+    """One student. Frozen in memory; invalid students cannot exist."""
 
     student_id: str
     first_name: str
@@ -145,22 +154,53 @@ class Student:
                 raise ValidationError("dob must be in the past")
 
     @classmethod
-    def new(cls, student_id: str, first_name: str, last_name: str, dob: str | None, sex: str,
-            *, is_active: bool = True) -> Student:
-        """Build a student from raw typed input. Cleans it, then applies the entry-only age rule."""
+    def new(
+        cls,
+        student_id: str,
+        first_name: str,
+        last_name: str,
+        dob: str,
+        sex: str,
+        *,
+        is_active: bool = True,
+    ) -> Student:
+        """Build a new student from typed input. `dob` is REQUIRED for all new students."""
+        parsed_dob = _parse_dob(dob)
         student = cls(
             student_id=clean_student_id(student_id),
             first_name=_tidy(first_name, "first_name"),
             last_name=_tidy(last_name, "last_name"),
-            dob=_parse_dob(dob) if dob is not None else None,
+            dob=parsed_dob,
             sex=parse_enum(Sex, sex, "sex"),
             is_active=is_active,
         )
-        if student.dob is not None:
-            age = student.age()
-            if not MIN_ENTRY_AGE <= age <= MAX_ENTRY_AGE:
-                raise ValidationError(f"dob gives an age of {age}; expected {MIN_ENTRY_AGE}-{MAX_ENTRY_AGE}")
+        age = student.age()
+        if not MIN_ENTRY_AGE <= age <= MAX_ENTRY_AGE:
+            raise ValidationError(f"dob gives an age of {age}; expected {MIN_ENTRY_AGE}-{MAX_ENTRY_AGE}")
         return student
+
+    @classmethod
+    def legacy(
+        cls,
+        student_id: str,
+        first_name: str,
+        last_name: str,
+        sex: str,
+        *,
+        is_active: bool = True,
+    ) -> Student:
+        """Build a legacy roster student whose DOB was not recorded in the historical Excel.
+
+        Can only be inserted while `db.legacy_import_mode()` is active.
+        """
+        return cls(
+            student_id=clean_student_id(student_id),
+            first_name=_tidy(first_name, "first_name"),
+            last_name=_tidy(last_name, "last_name"),
+            dob=None,
+            sex=parse_enum(Sex, sex, "sex"),
+            is_active=is_active,
+        )
 
     @classmethod
     def from_row(cls, row: tuple) -> Student:
@@ -218,6 +258,12 @@ CREATE TABLE IF NOT EXISTS students (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_students_person
     ON students (lower(first_name), lower(last_name), dob);
 
+DROP TRIGGER IF EXISTS students_require_dob_when_locked;
+CREATE TRIGGER students_require_dob_when_locked BEFORE INSERT ON students
+WHEN NEW.dob IS NULL
+  AND COALESCE((SELECT value FROM system_config WHERE key = 'allow_legacy_import'), '0') <> '1'
+BEGIN SELECT RAISE(ABORT, 'dob is required for all new students'); END;
+
 DROP TRIGGER IF EXISTS students_dob_in_past;
 CREATE TRIGGER students_dob_in_past BEFORE INSERT ON students
 WHEN NEW.dob IS NOT NULL AND NEW.dob >= date('now', 'localtime')
@@ -230,14 +276,15 @@ BEGIN SELECT RAISE(ABORT, 'dob must be in the past'); END;
 
 DROP TRIGGER IF EXISTS students_lock_identity;
 CREATE TRIGGER students_lock_identity
-BEFORE UPDATE OF student_id, first_name, last_name, sex, created_at ON students
-BEGIN SELECT RAISE(ABORT, 'student identity details are locked'); END;
+BEFORE UPDATE OF student_id, created_at ON students
+BEGIN SELECT RAISE(ABORT, 'student_id and created_at are locked'); END;
 
 DROP TRIGGER IF EXISTS students_lock_dob;
-CREATE TRIGGER students_lock_dob
+DROP TRIGGER IF EXISTS students_no_clear_dob;
+CREATE TRIGGER students_no_clear_dob
 BEFORE UPDATE OF dob ON students
-WHEN OLD.dob IS NOT NULL OR NEW.dob IS NULL
-BEGIN SELECT RAISE(ABORT, 'student identity details are locked'); END;
+WHEN OLD.dob IS NOT NULL AND NEW.dob IS NULL
+BEGIN SELECT RAISE(ABORT, 'dob cannot be cleared once set'); END;
 
 DROP TRIGGER IF EXISTS students_no_delete;
 CREATE TRIGGER students_no_delete BEFORE DELETE ON students
@@ -279,24 +326,60 @@ class StudentRepository(Repository):
         except sqlite3.IntegrityError as exc:
             raise self._translate(exc, student) from None
 
-    def set_dob(self, student_id: str, dob: str) -> Student:
-        """Record a student's date of birth once it becomes known (locked once set)."""
+    def update_details(
+        self,
+        student_id: str,
+        *,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        sex: str | Sex | None = None,
+        dob: str | None = None,
+    ) -> Student:
+        """Controlled correction of a student's name, sex, or DOB (student_id stays locked).
+
+        Re-checks every validation rule, duplicate-person check, and enrolment age/grade triggers.
+        """
         current = self.get(student_id)
-        parsed = _parse_dob(dob)
-        updated = replace(current, dob=parsed)
-        age = updated.age()
-        if not MIN_ENTRY_AGE <= age <= MAX_ENTRY_AGE:
-            raise ValidationError(f"dob gives an age of {age}; expected {MIN_ENTRY_AGE}-{MAX_ENTRY_AGE}")
+        new_first = _tidy(first_name, "first_name") if first_name is not None else current.first_name
+        new_last = _tidy(last_name, "last_name") if last_name is not None else current.last_name
+        if sex is None:
+            new_sex = current.sex
+        elif isinstance(sex, Sex):
+            new_sex = sex
+        else:
+            new_sex = parse_enum(Sex, sex, "sex")
+        new_dob = _parse_dob(dob) if dob is not None else current.dob
+
+        updated = replace(
+            current,
+            first_name=new_first,
+            last_name=new_last,
+            sex=new_sex,
+            dob=new_dob,
+        )
+        if dob is not None:
+            age = updated.age()
+            if not MIN_ENTRY_AGE <= age <= MAX_ENTRY_AGE:
+                raise ValidationError(
+                    f"dob gives an age of {age}; expected {MIN_ENTRY_AGE}-{MAX_ENTRY_AGE}"
+                )
+
+        dob_iso = updated.dob.isoformat() if updated.dob is not None else None
         try:
             with self._db.transaction() as conn:
                 self._refuse_same_person(conn, updated)
                 conn.execute(
-                    "UPDATE students SET dob = ? WHERE student_id = ?",
-                    (parsed.isoformat(), updated.student_id),
+                    "UPDATE students SET first_name = ?, last_name = ?, sex = ?, dob = ? "
+                    "WHERE student_id = ?",
+                    (updated.first_name, updated.last_name, updated.sex.value, dob_iso, updated.student_id),
                 )
         except sqlite3.IntegrityError as exc:
             raise self._translate(exc, updated) from None
         return updated
+
+    def set_dob(self, student_id: str, dob: str) -> Student:
+        """Record or correct a student's date of birth (cannot be cleared once set)."""
+        return self.update_details(student_id, dob=dob)
 
     def set_active(self, student_id: str, active: bool) -> None:
         """Activate or deactivate an existing student."""

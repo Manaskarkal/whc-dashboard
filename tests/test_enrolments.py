@@ -90,9 +90,9 @@ def test_new_cleans_input():
     (dict(season_year=2025.0), "whole number"),
     (dict(season_year=True), "whole number"),   # True counts as 1 in Python
     (dict(season_year=None), "whole number"),
-    (dict(sport="Bball"), "sport must be one of"),
-    (dict(sport="   "), "sport must be one of"),
-    (dict(sport=None), "sport must be one of"),
+    (dict(sport="   "), "sport must be"),
+    (dict(sport="123Sport"), "sport must be"),
+    (dict(sport=None), "sport must be text"),
     (dict(grade="Year 13"), "grade must be one of"),
     (dict(grade="   "), "grade must be one of"),
     (dict(grade=None), "grade must be one of"),
@@ -203,7 +203,7 @@ def test_filters_by_student_and_season(repo, two_students):
     sam = repo.for_student("aaa0001")  # lowercase on purpose
     assert [e.season_year for e in sam] == [2025, 2026, 2026]
     assert {e.student_id for e in sam} == {"AAA0001"}  # no Tom leaked in
-    assert [e.sport.value for e in repo.for_student("AAA0002", season_year=2026)] == ["Athletics"]
+    assert [e.sport for e in repo.for_student("AAA0002", season_year=2026)] == ["Athletics"]
     assert len(repo.all()) == 5
     assert len(repo.all(season_year=2026)) == 3
     assert len(repo.to_dataframe(season_year=2025)) == 2
@@ -511,9 +511,10 @@ def test_an_old_enrolments_table_gives_a_clear_error():
             EnrolmentRepository(database)
 
 
-def test_student_without_dob_can_enrol_and_later_dob_must_fit_enrolled_grades(students, repo):
-    """A student imported with dob=None can enrol; if dob is set later, it must fit their grades."""
-    students.add(Student.new("DDD0001", "Ava", "Fox", None, "Female"))
+def test_student_without_dob_can_enrol_and_later_dob_must_fit_enrolled_grades(db, students, repo):
+    """A legacy student imported with dob=None can enrol; if dob is set later, it must fit their grades."""
+    with db.legacy_import_mode():
+        students.add(Student.legacy("DDD0001", "Ava", "Fox", "Female"))
     repo.add(Enrolment.new("DDD0001", 2025, "Netball", "Year 12"))
 
     # Born in 2015 (age 10 in 2025) does not fit Year 12 (needs 15-20): refused by trigger.
@@ -524,3 +525,21 @@ def test_student_without_dob_can_enrol_and_later_dob_must_fit_enrolled_grades(st
     # Born in 2008 (age 17 in 2025) fits Year 12: accepted.
     students.set_dob("DDD0001", "01/06/2008")
     assert students.get("DDD0001").dob == date(2008, 6, 1)
+
+
+def test_custom_sport_can_be_added_at_runtime_without_code_changes(repo, student):
+    """Lead Coach can add a new sport (e.g. Futsal) directly to the DB and enrol students in it."""
+    with pytest.raises(ValidationError, match="sport must be one of"):
+        repo.add(Enrolment.new("AAA0001", 2025, "Futsal", "Year 8"))
+
+    added = repo.add_sport("  Futsal  ")
+    assert added == "Futsal"
+    assert "Futsal" in repo.sports()
+
+    with pytest.raises(DuplicateError, match="already exists"):
+        repo.add_sport("futsal")
+
+    saved = repo.add(Enrolment.new("AAA0001", 2025, "futsal", "Year 8"))
+    assert saved.sport == "Futsal"
+    df = repo.to_dataframe()
+    assert df["sport"].to_list() == ["Futsal"]

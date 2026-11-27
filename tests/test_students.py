@@ -146,19 +146,29 @@ def test_wrong_types_raise_validation_error(build):
         build()
 
 
-@pytest.mark.parametrize("field", ["student_id", "first_name", "last_name", "sex"])
+@pytest.mark.parametrize("field", ["student_id", "first_name", "last_name", "dob", "sex"])
 def test_none_input_raises_validation_error(field):
     """A blank required field often arrives as None; the caller gets a WhcError, not AttributeError."""
     with pytest.raises(ValidationError):
         Student.new(**{**GOOD, field: None})
 
 
-def test_dob_can_be_none_when_unknown():
-    """School rolls without DOB (like All Students in ssp_data.xlsx) pass dob=None."""
-    s = Student.new(**{**GOOD, "dob": None})
+def test_legacy_student_has_none_dob_and_requires_legacy_import_mode(db, repo):
+    """Legacy students from the historical roll have dob=None and can ONLY be inserted in legacy_import_mode."""
+    s = Student.legacy("AAA0002", "Sam", "Lee", "Male")
     assert s.dob is None
     with pytest.raises(ValidationError, match="dob is unknown"):
         s.age()
+
+    # Refused when legacy_import_mode is locked (the default)
+    with pytest.raises(ValidationError, match="dob is required for all new students"):
+        repo.add(s)
+
+    # Allowed strictly inside legacy_import_mode, which auto-relocks on exit
+    with db.legacy_import_mode():
+        repo.add(s)
+    assert db.is_legacy_import_open() is False
+    assert repo.get("AAA0002").dob is None
 
 
 # ==== 2. Ages and dates ==================================================================
@@ -334,14 +344,27 @@ def test_database_and_python_agree_on_today(repo, db):
 
 # ==== 5. Table upkeep ======================================================================
 @pytest.mark.parametrize("column, value", [
-    ("student_id", "BBB0001"), ("first_name", "Tom"), ("last_name", "Ng"),
-    ("dob", "2011-01-01"), ("sex", "Female"), ("created_at", "2000-01-01T00:00:00Z"),
+    ("student_id", "BBB0001"), ("created_at", "2000-01-01T00:00:00Z"),
 ])
 def test_every_locked_column_is_locked(db, sam, column, value):
-    """Every column the trigger claims to lock must really refuse to change."""
+    """student_id and created_at are permanently locked."""
     with pytest.raises(sqlite3.DatabaseError, match="locked"):
         with db.transaction() as conn:
             conn.execute(f"UPDATE students SET {column} = ?", (value,))
+
+
+def test_update_details_allows_controlled_corrections_but_never_clears_dob(db, sam):
+    """Coaches/Lead Coach can fix typos in name, sex, or DOB, but cannot clear DOB to NULL."""
+    updated = sam.update_details("AAA0001", first_name="Samuel", last_name="Li", sex="Other", dob="15/03/2010")
+    assert (updated.first_name, updated.last_name, updated.sex, updated.dob) == (
+        "Samuel", "Li", Sex.OTHER, date(2010, 3, 15)
+    )
+    assert sam.get("AAA0001") == updated
+
+    # Clearing an existing DOB back to NULL is refused by SQLite trigger
+    with pytest.raises(sqlite3.IntegrityError, match="cannot be cleared"):
+        with db.transaction() as conn:
+            conn.execute("UPDATE students SET dob = NULL WHERE student_id = 'AAA0001'")
 
 
 def test_students_cannot_be_deleted(db, sam):
@@ -357,29 +380,30 @@ def test_table_creation_is_repeatable_and_keeps_data(db, sam):
     assert len(StudentRepository(db).all()) == 1
 
 
-def test_student_without_dob_round_trips_and_can_set_dob_once(repo):
-    """A student imported with dob=None can be saved, queried, and given a DOB once later."""
-    s = Student.new("AAA0002", "Sam", "Lee", None, "Male")
-    repo.add(s)
+def test_student_without_dob_round_trips_and_can_backfill_and_correct_dob(db, repo):
+    """A legacy student imported with dob=None can be saved, queried, backfilled, and corrected."""
+    with db.legacy_import_mode():
+        repo.add(Student.legacy("AAA0002", "Sam", "Lee", "Male"))
+        repo.add(Student.legacy("AAA0003", "Sam", "Lee", "Male"))
+
     loaded = repo.get("AAA0002")
     assert loaded.dob is None
     df = repo.to_dataframe()
-    assert df["dob"].to_list() == [None]
+    assert df["dob"].to_list() == [None, None]
     assert df.schema["dob"] == pl.Date
 
-    # Two students with the same name and unknown DOB are allowed under different IDs.
-    repo.add(Student.new("AAA0003", "Sam", "Lee", None, "Male"))
-    assert len(repo.all()) == 2
-
-    # Once DOB becomes known, set_dob records it and locks it forever.
+    # Backfill DOB on AAA0002
     updated = repo.set_dob("AAA0002", "14/03/2010")
     assert updated.dob == date(2010, 3, 14)
     assert repo.get("AAA0002").dob == date(2010, 3, 14)
-    with pytest.raises(ValidationError, match="locked"):
-        repo.set_dob("AAA0002", "15/03/2010")
+
     # Setting AAA0003 to the same DOB as AAA0002 (same name + same DOB) is refused.
     with pytest.raises(DuplicateError, match="already in the database"):
         repo.set_dob("AAA0003", "14/03/2010")
+
+    # Correcting a typo in AAA0002's DOB is allowed
+    corrected = repo.set_dob("AAA0002", "15/03/2010")
+    assert corrected.dob == date(2010, 3, 15)
 
 
 def test_triggers_are_rebuilt_on_startup(db, repo):

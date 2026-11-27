@@ -33,9 +33,10 @@ backups/
 secrets.toml
 .streamlit/secrets.toml
 
-# Caches and logs
+# Caches, notebooks, and logs
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 *.log
+*.ipynb
 
